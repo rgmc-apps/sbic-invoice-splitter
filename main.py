@@ -1,5 +1,5 @@
 from __future__ import annotations
-import datetime, io, json, os, re, secrets, tempfile, threading, time, traceback, zipfile
+import datetime, io, json, os, re, secrets, statistics, tempfile, threading, time, traceback, zipfile
 from pathlib import Path
 from flask import Flask, abort, jsonify, redirect, render_template, request, send_file, url_for
 
@@ -117,6 +117,72 @@ def _extract_si(doc: fitz.Document, idx: int) -> tuple[str, str]:
     return f"page_{idx + 1:04d}", "fallback"
 
 
+def _infer_from_sequence(raw: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """
+    Detect a consecutive numeric pattern across successfully-extracted pages and
+    fill in any 'fallback' pages by inferring the expected SI number.
+
+    Algorithm:
+      1. Collect all pages whose SI is a pure integer string and method != 'fallback'.
+      2. For every consecutive pair of known pages compute (value_diff / page_gap).
+      3. Take the median step — robust against a few OCR mis-reads.
+      4. If the step is a clean integer (±0.15 tolerance), anchor on the median
+         known page and project forward/backward to fill fallback pages.
+      5. Zero-padding width is matched to the widest known SI string.
+
+    Returns the same-length list with inferred values substituted where applicable.
+    """
+    # ── collect known numeric pages ────────────────────────────────────────────
+    known: dict[int, int] = {}   # page_idx → integer SI value
+    pad_width: int = 0           # widest known SI string (for zero-padding)
+    for i, (si, method) in enumerate(raw):
+        if method != "fallback" and re.fullmatch(r"\d+", si):
+            known[i] = int(si)
+            pad_width = max(pad_width, len(si))
+
+    if len(known) < 2:
+        return raw  # not enough data to detect a pattern
+
+    # ── detect step ───────────────────────────────────────────────────────────
+    sorted_known = sorted(known.items())
+    steps: list[float] = []
+    for j in range(1, len(sorted_known)):
+        i1, v1 = sorted_known[j]
+        i0, v0 = sorted_known[j - 1]
+        gap = i1 - i0
+        if gap > 0:
+            steps.append((v1 - v0) / gap)
+
+    if not steps:
+        return raw
+
+    step_f = statistics.median(steps)
+    if abs(step_f - round(step_f)) > 0.15:
+        return raw  # non-integer step — not a reliable sequence
+    step = int(round(step_f))
+    if step == 0:
+        return raw  # all same value — nothing useful to infer
+
+    # ── anchor on the median known page (minimises propagation error) ─────────
+    mid = len(sorted_known) // 2
+    anchor_idx, anchor_val = sorted_known[mid]
+
+    def _project(page_idx: int) -> str:
+        val = anchor_val + (page_idx - anchor_idx) * step
+        if val < 0:
+            return str(val)
+        return str(val).zfill(pad_width)
+
+    # ── fill fallback pages ────────────────────────────────────────────────────
+    result = list(raw)
+    for i, (si, method) in enumerate(raw):
+        if method == "fallback":
+            inferred = _sanitize(_project(i))
+            result[i] = (inferred, "sequence")
+
+    return result
+
+
 def _optimize_pdf(pdf_bytes: bytes) -> bytes:
     """Lossless rewrite: strip unreferenced objects, recompress streams/images/fonts."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -131,13 +197,20 @@ def _optimize_pdf(pdf_bytes: bytes) -> bytes:
 def process_pdf(pdf_bytes: bytes, customer_code: str) -> tuple[list[dict], bytes]:
     """Split every page into its own PDF named SI_{customer_code}_{si_number}.pdf."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    # ── Pass 1: extract SI from every page individually ───────────────────────
+    raw: list[tuple[str, str]] = [_extract_si(doc, i) for i in range(doc.page_count)]
+
+    # ── Pass 2: fill fallback pages via consecutive-sequence inference ─────────
+    raw = _infer_from_sequence(raw)
+
+    # ── Pass 3: build ZIP with final filenames ────────────────────────────────
     results: list[dict] = []
     used: dict[str, int] = {}
     zip_buf = io.BytesIO()
 
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for i in range(doc.page_count):
-            si, method = _extract_si(doc, i)
+        for i, (si, method) in enumerate(raw):
             base = si
             if base in used:
                 used[base] += 1
