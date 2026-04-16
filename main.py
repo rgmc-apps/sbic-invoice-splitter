@@ -221,11 +221,19 @@ def _generate_upload_url(blob_name: str) -> str:
 def _save_result(results: list[dict], zip_bytes: bytes,
                  original_size: int, optimized_size: int) -> str:
     token = secrets.token_urlsafe(24)
-    (TMP_DIR / f"{token}.zip").write_bytes(zip_bytes)
+
+    # Upload ZIP to GCS so any Cloud Run instance can serve the download.
+    zip_blob_name = f"results/{token}.zip"
+    _storage().bucket(UPLOAD_BUCKET).blob(zip_blob_name).upload_from_string(
+        zip_bytes, content_type="application/zip"
+    )
+
+    # Keep a local JSON sidecar for the result page (tiny, fast).
     (TMP_DIR / f"{token}.json").write_text(json.dumps({
         "results": results,
         "original_size": original_size,
         "optimized_size": optimized_size,
+        "zip_blob": zip_blob_name,
     }))
     return token
 
@@ -386,11 +394,33 @@ def result(token: str):
 def download(token: str):
     if not re.fullmatch(r'[A-Za-z0-9_\-]{24,40}', token):
         abort(404)
-    zip_path = TMP_DIR / f"{token}.zip"
-    if not zip_path.exists():
+
+    # Resolve the GCS blob name from the JSON sidecar.
+    meta_path = TMP_DIR / f"{token}.json"
+    if not meta_path.exists():
         abort(404)
-    return send_file(zip_path, as_attachment=True,
-                     download_name="invoices.zip", mimetype="application/zip")
+    meta = json.loads(meta_path.read_text())
+    zip_blob_name = meta.get("zip_blob")
+    if not zip_blob_name:
+        abort(404)
+
+    # Generate a short-lived signed URL and redirect the browser to it.
+    try:
+        credentials, _ = google.auth.default()
+        credentials.refresh(_google_requests.Request())
+        blob = _storage().bucket(UPLOAD_BUCKET).blob(zip_blob_name)
+        signed_url = blob.generate_signed_url(
+            version="v4",
+            expiration=datetime.timedelta(minutes=15),
+            method="GET",
+            response_disposition='attachment; filename="invoices.zip"',
+            service_account_email=credentials.service_account_email,
+            access_token=credentials.token,
+        )
+    except Exception as exc:
+        return jsonify({"error": f"Could not generate download URL: {exc}"}), 500
+
+    return redirect(signed_url, code=302)
 
 
 if __name__ == "__main__":
