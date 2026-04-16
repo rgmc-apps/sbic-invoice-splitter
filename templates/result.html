@@ -31,6 +31,9 @@
     .stat-item{text-align:center}
     .stat-num{font-size:28px;font-weight:700;color:var(--navy);line-height:1}
     .stat-lbl{font-size:12px;color:var(--muted);margin-top:2px}
+    .compress-bar-wrap{background:#e5e7eb;border-radius:999px;height:10px;overflow:hidden;margin:6px 0 2px}
+    .compress-bar{height:100%;border-radius:999px;background:linear-gradient(90deg,#0F4C81,#3b82f6);transition:width .6s ease}
+    .compress-saved{color:var(--green);font-weight:600}
   </style>
 </head>
 <body>
@@ -39,14 +42,29 @@
   <div class="sub">{{ results|length }} page{{ 's' if results|length != 1 else '' }} processed successfully.</div>
 
   <!-- Stats -->
-  {% set text_count   = results | selectattr('method', 'in', ['text-bottom','text-right','text-full']) | list | length %}
-  {% set bar_count    = results | selectattr('method', 'equalto', 'barcode') | list | length %}
-  {% set fall_count   = results | selectattr('method', 'equalto', 'fallback') | list | length %}
+  {% set text_count  = results | selectattr('method', 'in', ['text-bottom','text-right','text-full']) | list | length %}
+  {% set bar_count   = results | selectattr('method', 'equalto', 'barcode') | list | length %}
+  {% set fall_count  = results | selectattr('method', 'equalto', 'fallback') | list | length %}
+  {% set saved_pct   = ((original_size - optimized_size) / original_size * 100) | round(1) %}
+  {% set orig_mb     = (original_size   / 1048576) | round(2) %}
+  {% set opt_mb      = (optimized_size  / 1048576) | round(2) %}
   <div class="stat">
     <div class="stat-item"><div class="stat-num">{{ results|length }}</div><div class="stat-lbl">Total pages</div></div>
     <div class="stat-item"><div class="stat-num" style="color:var(--green)">{{ text_count }}</div><div class="stat-lbl">Via text</div></div>
     <div class="stat-item"><div class="stat-num" style="color:#856404">{{ bar_count }}</div><div class="stat-lbl">Via barcode</div></div>
     {% if fall_count %}<div class="stat-item"><div class="stat-num" style="color:#b00020">{{ fall_count }}</div><div class="stat-lbl">Unidentified</div></div>{% endif %}
+  </div>
+
+  <!-- PDF compression summary -->
+  <div class="card" style="padding:16px 22px">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">
+      <span style="font-weight:600">PDF optimised before processing</span>
+      <span class="compress-saved">&#8722;{{ saved_pct }}% ({{ orig_mb }} MB → {{ opt_mb }} MB)</span>
+    </div>
+    <div class="compress-bar-wrap">
+      <div class="compress-bar" style="width:{{ 100 - saved_pct }}%"></div>
+    </div>
+    <div style="font-size:12px;color:var(--muted)">Lossless — streams, images, and fonts recompressed. Uploaded optimised copy to storage.</div>
   </div>
 
   <!-- Action buttons -->
