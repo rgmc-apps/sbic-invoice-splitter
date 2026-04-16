@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Invoice Separator — Results</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root{ --navy:#0F4C81; --sand:#E2A867; --ink:#0b1220; --muted:#667085; --bg:#F7F9FC; --card:#FFFFFF; --border:#E5E7EB; --green:#0a7d1a; }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+    .wrap{max-width:820px;margin:48px auto;padding:0 20px}
+    h1{margin:0 0 4px;font-size:24px}
+    .sub{color:var(--muted);margin:0 0 24px}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:22px;box-shadow:0 6px 16px rgba(15,76,129,.08);margin-bottom:16px}
+    .actions{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}
+    .btn{display:inline-flex;align-items:center;gap:6px;background:var(--navy);color:#fff;border:0;border-radius:10px;padding:10px 22px;font-weight:600;cursor:pointer;font-size:15px;text-decoration:none}
+    .btn:hover{filter:brightness(1.08)}
+    .btn-outline{background:#fff;color:var(--navy);border:2px solid var(--navy)}
+    table{width:100%;border-collapse:collapse;font-size:14px}
+    th{background:#f0f4f9;text-align:left;padding:8px 12px;border-bottom:2px solid var(--border);color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
+    td{padding:9px 12px;border-bottom:1px solid var(--border);vertical-align:middle}
+    tr:last-child td{border-bottom:none}
+    tr:hover td{background:#fafbfd}
+    code{background:#f0f4f9;padding:2px 6px;border-radius:4px;font-size:13px}
+    .pill{display:inline-block;font-size:11px;padding:2px 8px;border-radius:999px;font-weight:500}
+    .pill-text  {background:#e8f4e8;color:#155724}
+    .pill-bar   {background:#fff3cd;color:#856404}
+    .pill-fall  {background:#fde8e8;color:#7c1e1e}
+    .note{color:var(--muted);font-size:13px;margin-top:4px}
+    .stat{display:flex;gap:24px;flex-wrap:wrap;margin-bottom:20px}
+    .stat-item{text-align:center}
+    .stat-num{font-size:28px;font-weight:700;color:var(--navy);line-height:1}
+    .stat-lbl{font-size:12px;color:var(--muted);margin-top:2px}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Processing Complete</h1>
+  <div class="sub">{{ results|length }} page{{ 's' if results|length != 1 else '' }} processed successfully.</div>
+
+  <!-- Stats -->
+  {% set text_count   = results | selectattr('method', 'in', ['text-bottom','text-right','text-full']) | list | length %}
+  {% set bar_count    = results | selectattr('method', 'equalto', 'barcode') | list | length %}
+  {% set fall_count   = results | selectattr('method', 'equalto', 'fallback') | list | length %}
+  <div class="stat">
+    <div class="stat-item"><div class="stat-num">{{ results|length }}</div><div class="stat-lbl">Total pages</div></div>
+    <div class="stat-item"><div class="stat-num" style="color:var(--green)">{{ text_count }}</div><div class="stat-lbl">Via text</div></div>
+    <div class="stat-item"><div class="stat-num" style="color:#856404">{{ bar_count }}</div><div class="stat-lbl">Via barcode</div></div>
+    {% if fall_count %}<div class="stat-item"><div class="stat-num" style="color:#b00020">{{ fall_count }}</div><div class="stat-lbl">Unidentified</div></div>{% endif %}
+  </div>
+
+  <!-- Action buttons -->
+  <div class="actions">
+    <a class="btn" href="/download/{{ token }}">
+      <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+        <path d="M12 15V3m0 12-4-4m4 4 4-4M2 17l.621 2.485A2 2 0 0 0 4.561 21h14.878a2 2 0 0 0 1.94-1.515L22 17"/>
+      </svg>
+      Download ZIP
+    </a>
+    <a class="btn btn-outline" href="/">Process Another</a>
+  </div>
+
+  <!-- Results table -->
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:60px">Page</th>
+          <th>Output filename</th>
+          <th style="width:110px">Method</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in results %}
+        <tr>
+          <td>{{ r.page }}</td>
+          <td><code>{{ r.filename }}</code></td>
+          <td>
+            {% if r.method in ['text-bottom','text-right','text-full'] %}
+              <span class="pill pill-text">{{ r.method }}</span>
+            {% elif r.method == 'barcode' %}
+              <span class="pill pill-bar">barcode</span>
+            {% else %}
+              <span class="pill pill-fall">fallback</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note">Files are available for download for 1 hour.</div>
+</div>
+</body>
+</html>

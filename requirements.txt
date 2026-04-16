@@ -1,0 +1,5 @@
+flask==3.*
+pymupdf==1.*
+pyzbar==0.1.*
+Pillow==10.*
+gunicorn==21.*

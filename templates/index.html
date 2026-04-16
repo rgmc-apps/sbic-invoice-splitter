@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Invoice Separator</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root{ --navy:#0F4C81; --sand:#E2A867; --ink:#0b1220; --muted:#667085; --bg:#F7F9FC; --card:#FFFFFF; --border:#E5E7EB; }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+    .wrap{max-width:820px;margin:48px auto;padding:0 20px}
+    .header{display:flex;gap:14px;align-items:center;margin-bottom:10px}
+    .logo{width:44px;height:44px;border-radius:12px;object-fit:contain;background:#fff;border:1px solid var(--border);padding:4px}
+    h1{margin:0;font-size:24px}
+    .sub{color:var(--muted);margin:4px 0 20px}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:22px;box-shadow:0 6px 16px rgba(15,76,129,.08);margin-bottom:16px}
+    .drop-zone{border:2px dashed rgba(15,76,129,.30);border-radius:12px;padding:44px 20px;background:#fbfdff;text-align:center;transition:border-color .2s,background .2s;cursor:pointer}
+    .drop-zone.dragover{border-color:var(--navy);background:#eef4fc}
+    .drop-zone input[type=file]{display:none}
+    .drop-zone label{cursor:pointer;color:var(--navy);font-weight:600;text-decoration:underline}
+    .file-name{margin-top:8px;color:var(--muted);font-size:13px}
+    .actions{margin-top:14px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+    .btn{background:var(--navy);color:#fff;border:0;border-radius:10px;padding:10px 22px;font-weight:600;cursor:pointer;font-size:15px}
+    .btn:hover{filter:brightness(1.08)}
+    .btn:disabled{opacity:.55;cursor:not-allowed}
+    .badge{display:inline-block;background:var(--sand);color:#2b1900;padding:2px 9px;border-radius:8px;font-size:12px;margin-left:6px}
+    .err{color:#b00020;margin-top:12px;padding:10px 14px;background:#fff0f0;border-radius:8px;border:1px solid #f5c6cb;font-size:14px}
+    .spinner{display:none;width:22px;height:22px;vertical-align:middle}
+    .spinner.active{display:inline-block}
+    h2{margin:0 0 8px;font-size:18px}
+    ol,ul{margin:8px 0 0 18px;padding-left:0;list-style-position:outside}
+    li{margin-bottom:4px}
+    h3{margin:16px 0 6px;font-size:15px}
+    code{background:#f0f4f9;padding:1px 5px;border-radius:4px;font-size:13px}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="header">
+    <img class="logo" src="/static/logo.png" alt="RGMC Logo" onerror="this.style.display='none'">
+    <div>
+      <h1>Invoice Separator <span class="badge">Beta</span></h1>
+      <div class="sub">Upload a multi-page sales invoice PDF — get individual PDFs named by SI number.</div>
+    </div>
+  </div>
+
+  <form class="card" id="upForm" action="/upload" method="post" enctype="multipart/form-data">
+    <div class="drop-zone" id="dropZone">
+      <input type="file" name="file" id="fileInput" accept=".pdf" required>
+      <svg width="44" height="44" fill="none" stroke="#0F4C81" stroke-width="1.5" viewBox="0 0 24 24" style="display:block;margin:0 auto 10px">
+        <path d="M12 16V8m0 0-3 3m3-3 3 3M20 16.7A4 4 0 0 0 18 9h-1.26A7 7 0 1 0 5 15.7"/>
+      </svg>
+      <div>Drag &amp; drop a PDF here, or <label for="fileInput">browse</label></div>
+      <div class="file-name" id="fileName">No file chosen</div>
+    </div>
+
+    <div class="actions">
+      <button class="btn" type="submit" id="submitBtn">Process &amp; Split</button>
+      <span class="sub">PDF only &nbsp;·&nbsp; Max {{ max_mb }} MB</span>
+      <svg class="spinner" id="spinner" viewBox="0 0 50 50">
+        <circle cx="25" cy="25" r="20" fill="none" stroke="#0F4C81" stroke-width="5"
+                stroke-dasharray="31.4 94.2" stroke-linecap="round">
+          <animateTransform attributeName="transform" type="rotate"
+            from="0 25 25" to="360 25 25" dur="0.8s" repeatCount="indefinite"/>
+        </circle>
+      </svg>
+    </div>
+
+    {% if error %}
+    <div class="err">{{ error }}</div>
+    {% endif %}
+  </form>
+
+  <div class="card">
+    <h2>How it works</h2>
+    <ol>
+      <li>Upload a multi-page PDF containing multiple sales invoices.</li>
+      <li>Each page is split into its own PDF file.</li>
+      <li>The SI number is automatically read from the text under the barcode or near the lower-right corner of each page.</li>
+      <li>Download a ZIP containing all individual PDFs, each named <code>&lt;SI-Number&gt;.pdf</code>.</li>
+    </ol>
+
+    <h3>Extraction methods (tried in order)</h3>
+    <ul>
+      <li><b>text-bottom</b> — fast text extraction from the bottom 40 % of the page.</li>
+      <li><b>text-right</b> — text extraction from the right half of the page.</li>
+      <li><b>text-full</b> — full-page text extraction.</li>
+      <li><b>barcode</b> — renders the page as an image and decodes any barcode (Code 128, QR, etc.).</li>
+      <li><b>fallback</b> — if no SI number is found, the page is named <code>page_NNNN.pdf</code>.</li>
+    </ul>
+
+    <h3>File requirements</h3>
+    <ul>
+      <li>PDF only &nbsp;·&nbsp; Max <b>{{ max_mb }} MB</b></li>
+      <li>Text-based PDFs give the best and fastest results.</li>
+      <li>Scanned PDFs are supported via barcode decoding.</li>
+      <li>Password-protected PDFs are not supported.</li>
+    </ul>
+  </div>
+</div>
+
+<script>
+  const drop   = document.getElementById('dropZone');
+  const input  = document.getElementById('fileInput');
+  const label  = document.getElementById('fileName');
+  const form   = document.getElementById('upForm');
+  const btn    = document.getElementById('submitBtn');
+  const spin   = document.getElementById('spinner');
+
+  input.addEventListener('change', () => {
+    label.textContent = input.files[0]?.name ?? 'No file chosen';
+  });
+
+  drop.addEventListener('dragover',  e => { e.preventDefault(); drop.classList.add('dragover'); });
+  drop.addEventListener('dragleave', ()=> drop.classList.remove('dragover'));
+  drop.addEventListener('drop', e => {
+    e.preventDefault();
+    drop.classList.remove('dragover');
+    const file = e.dataTransfer.files[0];
+    if (file) {
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      input.files = dt.files;
+      label.textContent = file.name;
+    }
+  });
+
+  form.addEventListener('submit', () => {
+    btn.disabled = true;
+    btn.textContent = 'Processing…';
+    spin.classList.add('active');
+  });
+</script>
+</body>
+</html>
