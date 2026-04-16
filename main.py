@@ -1,5 +1,5 @@
 from __future__ import annotations
-import datetime, io, json, os, re, secrets, tempfile, time, zipfile
+import datetime, io, json, os, re, secrets, tempfile, threading, time, zipfile
 from pathlib import Path
 from flask import Flask, abort, redirect, render_template, request, send_file, url_for
 
@@ -195,8 +195,10 @@ def _upload_to_gcs(pdf_bytes: bytes, original_filename: str) -> str:
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_MB * 1024 * 1024
 
-# Set lifecycle rule once when the worker process starts.
-_ensure_lifecycle()
+# Run lifecycle setup in a daemon thread so it never delays gunicorn's port bind.
+# Cloud Run kills the container if the port isn't ready within the startup timeout;
+# moving this off the critical path ensures the server is always reachable first.
+threading.Thread(target=_ensure_lifecycle, daemon=True).start()
 
 
 @app.get("/")
