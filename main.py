@@ -4,6 +4,8 @@ from pathlib import Path
 from flask import Flask, abort, jsonify, redirect, render_template, request, send_file, url_for
 
 import fitz  # PyMuPDF
+import google.auth
+import google.auth.transport.requests as _google_requests
 from google.cloud import storage as gcs
 from PIL import Image
 
@@ -17,11 +19,9 @@ except Exception:
     _pyzbar = None  # type: ignore[assignment]
     _ZBAR_OK = False
 
-UPLOAD_LIMIT_MB  = int(os.environ.get("UPLOAD_LIMIT_MB",  500))   # soft cap for normal uploads
-OPTIMIZE_LIMIT_MB = int(os.environ.get("OPTIMIZE_LIMIT_MB", 2048))  # hard cap for the optimize-only endpoint
-MAX_MB = UPLOAD_LIMIT_MB   # kept for template compatibility
-UPLOAD_BUCKET = os.environ.get("UPLOAD_BUCKET", "sbic-splitter-uploads")
-TMP_DIR = Path(tempfile.gettempdir()) / "inv_sep"
+UPLOAD_BUCKET     = os.environ.get("UPLOAD_BUCKET", "sbic-splitter-uploads")
+OPTIMIZE_LIMIT_MB = int(os.environ.get("OPTIMIZE_LIMIT_MB", 2048))  # Flask hard cap for /optimize-only
+TMP_DIR           = Path(tempfile.gettempdir()) / "inv_sep"
 TMP_DIR.mkdir(exist_ok=True)
 RESULT_TTL = 3600  # seconds — local temp files expire after 1 hour
 
@@ -46,8 +46,6 @@ def _resolve_customer_code(filename: str) -> str:
 
 
 # ── SI-number extraction patterns ─────────────────────────────────────────────
-# Philippine sales invoices typically show "SI No.: XXXXXXXX" or a bare number
-# printed under a barcode near the lower-right corner of the page.
 _SI_RE = [
     re.compile(r'\bS\.?I\.?\s*(?:No\.?|Num(?:ber)?|#|:)?\s*[:\-]?\s*([A-Z0-9]{4,}(?:[-]\d+)*)', re.I),
     re.compile(r'(?:Sales\s+Invoice|Invoice)\s*(?:No\.?|#|:)?\s*([A-Z0-9]{5,20})', re.I),
@@ -57,7 +55,6 @@ _SI_RE = [
 
 
 def _sanitize(name: str) -> str:
-    """Strip characters illegal in filenames and cap length."""
     return re.sub(r'[\\/*?:"<>|\r\n\t]', '_', name).strip().strip('._')[:80] or "unknown"
 
 
@@ -71,27 +68,21 @@ def _find_si(text: str) -> str | None:
 
 
 def _extract_si(doc: fitz.Document, idx: int) -> tuple[str, str]:
-    """Return (si_number, method_used) for the given page index."""
     page = doc[idx]
-    h = page.rect.height
-    w = page.rect.width
+    h, w = page.rect.height, page.rect.width
 
-    # 1. Text — bottom 40 % of page (SI number is usually here)
     si = _find_si(page.get_text("text", clip=fitz.Rect(0, h * 0.60, w, h)))
     if si:
         return si, "text-bottom"
 
-    # 2. Text — right half (lower-right corner fallback)
     si = _find_si(page.get_text("text", clip=fitz.Rect(w * 0.50, 0, w, h)))
     if si:
         return si, "text-right"
 
-    # 3. Full-page text
     si = _find_si(page.get_text("text"))
     if si:
         return si, "text-full"
 
-    # 4. Barcode decode — render bottom half at 2× scale (only when libzbar0 is present)
     if _ZBAR_OK:
         try:
             mat = fitz.Matrix(2, 2)
@@ -99,7 +90,6 @@ def _extract_si(doc: fitz.Document, idx: int) -> tuple[str, str]:
             img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
             codes = _pyzbar.decode(img)
             if not codes:
-                # Retry on full page at 1.5×
                 pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), colorspace=fitz.csGRAY)
                 img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
                 codes = _pyzbar.decode(img)
@@ -114,28 +104,10 @@ def _extract_si(doc: fitz.Document, idx: int) -> tuple[str, str]:
 
 
 def _optimize_pdf(pdf_bytes: bytes) -> bytes:
-    """
-    Rewrite the PDF with PyMuPDF's maximum lossless compression:
-      garbage=4        — remove all unreferenced objects and deduplicate streams
-      deflate=True     — zlib-compress all compressible streams
-      deflate_images   — compress embedded image streams
-      deflate_fonts    — compress embedded font streams
-      clean=True       — normalise and sanitise content streams
-
-    This is lossless — visual quality is unchanged.
-    Typical reduction: 20–60 % for scanned PDFs, 10–30 % for text PDFs.
-    Returns the original bytes unchanged if optimisation produces a larger file.
-    """
+    """Lossless rewrite: strip unreferenced objects, recompress streams/images/fonts."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     buf = io.BytesIO()
-    doc.save(
-        buf,
-        garbage=4,
-        deflate=True,
-        deflate_images=True,
-        deflate_fonts=True,
-        clean=True,
-    )
+    doc.save(buf, garbage=4, deflate=True, deflate_images=True, deflate_fonts=True, clean=True)
     doc.close()
     buf.seek(0)
     optimized = buf.read()
@@ -143,8 +115,7 @@ def _optimize_pdf(pdf_bytes: bytes) -> bytes:
 
 
 def process_pdf(pdf_bytes: bytes, customer_code: str) -> tuple[list[dict], bytes]:
-    """Split every page into its own PDF named SI_{customer_code}_{si_number}.pdf,
-    return (results_list, zip_bytes)."""
+    """Split every page into its own PDF named SI_{customer_code}_{si_number}.pdf."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     results: list[dict] = []
     used: dict[str, int] = {}
@@ -153,8 +124,6 @@ def process_pdf(pdf_bytes: bytes, customer_code: str) -> tuple[list[dict], bytes
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for i in range(doc.page_count):
             si, method = _extract_si(doc, i)
-
-            # Deduplicate: append _2, _3 … for repeated SI numbers on different pages
             base = si
             if base in used:
                 used[base] += 1
@@ -167,7 +136,6 @@ def process_pdf(pdf_bytes: bytes, customer_code: str) -> tuple[list[dict], bytes
             page_bytes = single.tobytes(deflate=True)
             single.close()
 
-            # Output format: SI_{customer_code}_{si_number}.pdf
             filename = f"SI_{customer_code}_{si}.pdf"
             zf.writestr(filename, page_bytes)
             results.append({"page": i + 1, "si": si, "filename": filename, "method": method})
@@ -178,7 +146,6 @@ def process_pdf(pdf_bytes: bytes, customer_code: str) -> tuple[list[dict], bytes
 
 
 def _cleanup_old_files() -> None:
-    """Remove local temp files older than RESULT_TTL seconds."""
     now = time.time()
     for p in TMP_DIR.glob("*"):
         try:
@@ -200,147 +167,165 @@ def _storage() -> gcs.Client:
     return _gcs_client
 
 
-def _ensure_lifecycle() -> None:
-    """
-    Apply a 1-day auto-delete lifecycle rule to UPLOAD_BUCKET if one is not
-    already present. 1 day is the minimum age GCS Object Lifecycle supports.
-    Called once at startup; failures are non-fatal.
-    """
+def _configure_bucket() -> None:
+    """Set 1-day lifecycle rule and CORS for browser PUT uploads. Non-fatal."""
     try:
         bucket = _storage().bucket(UPLOAD_BUCKET)
         bucket.reload()
-        for rule in bucket.lifecycle_rules:
-            if rule.get("action", {}).get("type") == "Delete":
-                return  # a delete rule already exists — leave it alone
-        bucket.lifecycle_rules = [
-            {"action": {"type": "Delete"}, "condition": {"age": 1}}
-        ]
-        bucket.patch()
+
+        # 1-day auto-delete lifecycle
+        needs_lifecycle = not any(
+            r.get("action", {}).get("type") == "Delete"
+            for r in bucket.lifecycle_rules
+        )
+        if needs_lifecycle:
+            bucket.lifecycle_rules = [{"action": {"type": "Delete"}, "condition": {"age": 1}}]
+
+        # CORS — allow browsers to PUT directly to the bucket via signed URLs
+        needs_cors = not any("PUT" in c.get("method", []) for c in (bucket.cors or []))
+        if needs_cors:
+            bucket.cors = [{
+                "origin": ["*"],
+                "method": ["PUT"],
+                "responseHeader": ["Content-Type"],
+                "maxAgeSeconds": 3600,
+            }]
+
+        if needs_lifecycle or needs_cors:
+            bucket.patch()
     except Exception:
-        pass  # non-fatal: bucket may not exist yet, or ADC is unavailable locally
+        pass
 
 
-def _upload_to_gcs(pdf_bytes: bytes, original_filename: str) -> str:
-    """Upload raw PDF bytes to GCS and return the blob path."""
-    ts = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    safe = re.sub(r'[^A-Za-z0-9._-]', '_', Path(original_filename).name)[:80]
-    blob_name = f"uploads/{ts}-{secrets.token_hex(4)}-{safe}"
-    _storage().bucket(UPLOAD_BUCKET).blob(blob_name).upload_from_string(
-        pdf_bytes, content_type="application/pdf"
+def _generate_upload_url(blob_name: str) -> str:
+    """
+    Generate a V4 signed PUT URL for direct browser-to-GCS upload.
+
+    Uses the Cloud Run service account's access token to call IAM signBlob,
+    so no private-key file is required.  The service account must have
+    roles/iam.serviceAccountTokenCreator (or iam.serviceAccounts.signBlob).
+    """
+    credentials, _ = google.auth.default()
+    credentials.refresh(_google_requests.Request())
+    blob = _storage().bucket(UPLOAD_BUCKET).blob(blob_name)
+    return blob.generate_signed_url(
+        version="v4",
+        expiration=datetime.timedelta(minutes=15),
+        method="PUT",
+        content_type="application/pdf",
+        service_account_email=credentials.service_account_email,
+        access_token=credentials.token,
     )
-    return blob_name
+
+
+def _save_result(results: list[dict], zip_bytes: bytes,
+                 original_size: int, optimized_size: int) -> str:
+    token = secrets.token_urlsafe(24)
+    (TMP_DIR / f"{token}.zip").write_bytes(zip_bytes)
+    (TMP_DIR / f"{token}.json").write_text(json.dumps({
+        "results": results,
+        "original_size": original_size,
+        "optimized_size": optimized_size,
+    }))
+    return token
 
 
 # ── Flask app ──────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
-# Set the global hard limit to OPTIMIZE_LIMIT_MB so the /optimize-only
-# endpoint can accept files larger than the normal upload cap.
-# The /upload route enforces UPLOAD_LIMIT_MB itself.
+# Hard cap only applies to /optimize-only; all other routes are JSON or tiny.
 app.config["MAX_CONTENT_LENGTH"] = OPTIMIZE_LIMIT_MB * 1024 * 1024
 
-# Run lifecycle setup in a daemon thread so it never delays gunicorn's port bind.
-# Cloud Run kills the container if the port isn't ready within the startup timeout;
-# moving this off the critical path ensures the server is always reachable first.
-threading.Thread(target=_ensure_lifecycle, daemon=True).start()
+# Configure bucket (lifecycle + CORS) once in background — never blocks port bind.
+threading.Thread(target=_configure_bucket, daemon=True).start()
 
 
 @app.errorhandler(413)
 def too_large(e):
-    return render_template("error_413.html", upload_limit_mb=UPLOAD_LIMIT_MB,
-                           optimize_limit_mb=OPTIMIZE_LIMIT_MB), 413
+    return render_template("error_413.html", optimize_limit_mb=OPTIMIZE_LIMIT_MB), 413
 
 
 @app.get("/healthz")
 def healthz():
-    """Lightweight health check used by Cloud Run startup/liveness probes."""
     return jsonify({"status": "ok", "zbar": _ZBAR_OK})
 
 
 @app.get("/")
 def index():
-    return render_template("index.html", max_mb=MAX_MB, upload_limit_mb=UPLOAD_LIMIT_MB)
+    return render_template("index.html")
 
+
+# ── New primary upload flow (bypasses Cloud Run 32 MB ingress limit) ───────────
+
+@app.get("/request-upload-url")
+def request_upload_url():
+    """
+    Step 1 — return a short-lived signed GCS URL the browser can PUT to directly.
+    The file bytes never pass through Cloud Run, so there is no size limit.
+    """
+    filename = request.args.get("filename", "upload.pdf")
+    safe = re.sub(r'[^A-Za-z0-9._-]', '_', Path(filename).name)[:80]
+    ts = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    blob_name = f"uploads/{ts}-{secrets.token_hex(4)}-{safe}"
+    try:
+        url = _generate_upload_url(blob_name)
+    except Exception as exc:
+        return jsonify({"error": f"Could not generate upload URL: {exc}"}), 500
+    return jsonify({"url": url, "blob_name": blob_name})
+
+
+@app.post("/process")
+def process():
+    """
+    Step 2 — read the already-uploaded blob from GCS, optimise, split, return token.
+    Request body is tiny JSON; only the GCS→Cloud Run download happens here.
+    """
+    _cleanup_old_files()
+    data = request.get_json(silent=True) or {}
+    blob_name = (data.get("blob_name") or "").strip()
+    filename  = (data.get("filename")  or "upload.pdf").strip()
+
+    if not blob_name:
+        return jsonify({"error": "blob_name is required"}), 400
+
+    try:
+        pdf_bytes     = _storage().bucket(UPLOAD_BUCKET).blob(blob_name).download_as_bytes()
+        original_size = len(pdf_bytes)
+        customer_code = _resolve_customer_code(filename)
+        pdf_bytes     = _optimize_pdf(pdf_bytes)
+        optimized_size = len(pdf_bytes)
+        results, zip_bytes = process_pdf(pdf_bytes, customer_code)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    token = _save_result(results, zip_bytes, original_size, optimized_size)
+    return jsonify({"token": token})
+
+
+# ── Optimize-only (compress and return — no splitting) ────────────────────────
 
 @app.post("/optimize-only")
 def optimize_only():
-    """Accept a PDF (up to OPTIMIZE_LIMIT_MB), compress it, return the optimized file."""
     f = request.files.get("file")
     if not f or not f.filename:
-        return render_template("error_413.html", upload_limit_mb=UPLOAD_LIMIT_MB,
-                               optimize_limit_mb=OPTIMIZE_LIMIT_MB,
+        return render_template("error_413.html", optimize_limit_mb=OPTIMIZE_LIMIT_MB,
                                error="No file provided."), 400
     if not f.filename.lower().endswith(".pdf"):
-        return render_template("error_413.html", upload_limit_mb=UPLOAD_LIMIT_MB,
-                               optimize_limit_mb=OPTIMIZE_LIMIT_MB,
+        return render_template("error_413.html", optimize_limit_mb=OPTIMIZE_LIMIT_MB,
                                error="Only PDF files are accepted."), 400
 
     raw = f.read()
     optimized = _optimize_pdf(raw)
-    saved_pct = round((len(raw) - len(optimized)) / len(raw) * 100, 1)
-
-    stem = Path(f.filename).stem
-    dl_name = f"{stem}_optimized.pdf"
-
-    resp = send_file(
-        io.BytesIO(optimized),
-        as_attachment=True,
-        download_name=dl_name,
-        mimetype="application/pdf",
-    )
-    # Surface compression stats in response headers for the JS layer
+    resp = send_file(io.BytesIO(optimized), as_attachment=True,
+                     download_name=f"{Path(f.filename).stem}_optimized.pdf",
+                     mimetype="application/pdf")
     resp.headers["X-Original-Size"]  = str(len(raw))
     resp.headers["X-Optimized-Size"] = str(len(optimized))
-    resp.headers["X-Saved-Pct"]      = str(saved_pct)
+    resp.headers["X-Saved-Pct"]      = str(round((len(raw) - len(optimized)) / len(raw) * 100, 1))
     return resp
 
 
-@app.post("/upload")
-def upload():
-    _cleanup_old_files()
-    f = request.files.get("file")
-    if not f or not f.filename:
-        return render_template("index.html", error="No file selected.",
-                               max_mb=MAX_MB, upload_limit_mb=UPLOAD_LIMIT_MB)
-    if not f.filename.lower().endswith(".pdf"):
-        return render_template("index.html", error="Only PDF files are accepted.",
-                               max_mb=MAX_MB, upload_limit_mb=UPLOAD_LIMIT_MB)
-
-    # Manual soft cap — files between UPLOAD_LIMIT_MB and OPTIMIZE_LIMIT_MB reach
-    # this route because the global Flask limit is OPTIMIZE_LIMIT_MB.
-    content_len = request.content_length or 0
-    if content_len > UPLOAD_LIMIT_MB * 1024 * 1024:
-        return render_template("error_413.html", upload_limit_mb=UPLOAD_LIMIT_MB,
-                               optimize_limit_mb=OPTIMIZE_LIMIT_MB), 413
-
-    try:
-        raw_bytes = f.read()
-        original_size = len(raw_bytes)
-        customer_code = _resolve_customer_code(f.filename)
-
-        # Optimise before storing and processing — reduces GCS cost and speeds up splitting.
-        pdf_bytes = _optimize_pdf(raw_bytes)
-        optimized_size = len(pdf_bytes)
-
-        # Persist the optimised PDF to GCS (auto-deleted after 1 day).
-        _upload_to_gcs(pdf_bytes, f.filename)
-
-        # Process from the same in-memory bytes — no second GCS round-trip needed.
-        results, zip_bytes = process_pdf(pdf_bytes, customer_code)
-    except Exception as exc:
-        return render_template("index.html", error=f"Processing failed: {exc}", max_mb=MAX_MB)
-
-    token = secrets.token_urlsafe(24)
-    (TMP_DIR / f"{token}.zip").write_bytes(zip_bytes)
-    meta = {
-        "results": results,
-        "original_size": original_size,
-        "optimized_size": optimized_size,
-    }
-    (TMP_DIR / f"{token}.json").write_text(json.dumps(meta))
-
-    return redirect(url_for("result", token=token))
-
+# ── Result & download ─────────────────────────────────────────────────────────
 
 @app.get("/result/<token>")
 def result(token: str):
@@ -350,13 +335,9 @@ def result(token: str):
     if not meta_path.exists():
         abort(404)
     meta = json.loads(meta_path.read_text())
-    return render_template(
-        "result.html",
-        results=meta["results"],
-        original_size=meta["original_size"],
-        optimized_size=meta["optimized_size"],
-        token=token,
-    )
+    return render_template("result.html", results=meta["results"],
+                           original_size=meta["original_size"],
+                           optimized_size=meta["optimized_size"], token=token)
 
 
 @app.get("/download/<token>")
@@ -366,12 +347,8 @@ def download(token: str):
     zip_path = TMP_DIR / f"{token}.zip"
     if not zip_path.exists():
         abort(404)
-    return send_file(
-        zip_path,
-        as_attachment=True,
-        download_name="invoices.zip",
-        mimetype="application/zip",
-    )
+    return send_file(zip_path, as_attachment=True,
+                     download_name="invoices.zip", mimetype="application/zip")
 
 
 if __name__ == "__main__":

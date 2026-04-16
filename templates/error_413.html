@@ -46,9 +46,8 @@
   <div class="icon">📄</div>
   <h1>File Too Large</h1>
   <p class="sub">
-    The upload limit is <strong>{{ upload_limit_mb }} MB</strong>
-    <span class="badge-limit">{{ upload_limit_mb }} MB cap</span>.
-    Use the optimizer below to compress your PDF first — then re-upload the smaller file.
+    Your file exceeds the hard limit of <strong>{{ optimize_limit_mb }} MB</strong>.
+    Use the optimizer below to compress it first — then re-upload the smaller file.
   </p>
 
   {% if error %}
@@ -62,7 +61,6 @@
         <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/>
       </svg>
       Optimize &amp; Download
-      <span class="badge-opt">up to {{ optimize_limit_mb }} MB</span>
     </h2>
     <p>Select your PDF below. We'll strip unused objects and recompress streams — lossless, no visual change. Download the smaller file, then re-upload it normally.</p>
 
