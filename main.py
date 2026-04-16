@@ -1,7 +1,7 @@
 from __future__ import annotations
 import datetime, io, json, os, re, secrets, tempfile, threading, time, zipfile
 from pathlib import Path
-from flask import Flask, abort, redirect, render_template, request, send_file, url_for
+from flask import Flask, abort, jsonify, redirect, render_template, request, send_file, url_for
 
 import fitz  # PyMuPDF
 from google.cloud import storage as gcs
@@ -214,7 +214,7 @@ threading.Thread(target=_ensure_lifecycle, daemon=True).start()
 @app.get("/healthz")
 def healthz():
     """Lightweight health check used by Cloud Run startup/liveness probes."""
-    return {"status": "ok", "zbar": _ZBAR_OK}, 200
+    return jsonify({"status": "ok", "zbar": _ZBAR_OK})
 
 
 @app.get("/")
