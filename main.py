@@ -1,16 +1,18 @@
 from __future__ import annotations
-import io, json, os, re, secrets, tempfile, time, zipfile
+import datetime, io, json, os, re, secrets, tempfile, time, zipfile
 from pathlib import Path
 from flask import Flask, abort, redirect, render_template, request, send_file, url_for
 
 import fitz  # PyMuPDF
+from google.cloud import storage as gcs
 from PIL import Image
 from pyzbar import pyzbar as zbar
 
 MAX_MB = 500
+UPLOAD_BUCKET = os.environ.get("UPLOAD_BUCKET", "sbic-splitter-uploads")
 TMP_DIR = Path(tempfile.gettempdir()) / "inv_sep"
 TMP_DIR.mkdir(exist_ok=True)
-RESULT_TTL = 3600  # seconds — temp files expire after 1 hour
+RESULT_TTL = 3600  # seconds — local temp files expire after 1 hour
 
 # ── SI-number extraction patterns ─────────────────────────────────────────────
 # Philippine sales invoices typically show "SI No.: XXXXXXXX" or a bare number
@@ -113,7 +115,7 @@ def process_pdf(pdf_bytes: bytes) -> tuple[list[dict], bytes]:
 
 
 def _cleanup_old_files() -> None:
-    """Remove temp files older than RESULT_TTL seconds."""
+    """Remove local temp files older than RESULT_TTL seconds."""
     now = time.time()
     for p in TMP_DIR.glob("*"):
         try:
@@ -123,10 +125,56 @@ def _cleanup_old_files() -> None:
             pass
 
 
+# ── Google Cloud Storage ───────────────────────────────────────────────────────
+
+_gcs_client: gcs.Client | None = None
+
+
+def _storage() -> gcs.Client:
+    global _gcs_client
+    if _gcs_client is None:
+        _gcs_client = gcs.Client()
+    return _gcs_client
+
+
+def _ensure_lifecycle() -> None:
+    """
+    Apply a 1-day auto-delete lifecycle rule to UPLOAD_BUCKET if one is not
+    already present. 1 day is the minimum age GCS Object Lifecycle supports.
+    Called once at startup; failures are non-fatal.
+    """
+    try:
+        bucket = _storage().bucket(UPLOAD_BUCKET)
+        bucket.reload()
+        for rule in bucket.lifecycle_rules:
+            if rule.get("action", {}).get("type") == "Delete":
+                return  # a delete rule already exists — leave it alone
+        bucket.lifecycle_rules = [
+            {"action": {"type": "Delete"}, "condition": {"age": 1}}
+        ]
+        bucket.patch()
+    except Exception:
+        pass  # non-fatal: bucket may not exist yet, or ADC is unavailable locally
+
+
+def _upload_to_gcs(pdf_bytes: bytes, original_filename: str) -> str:
+    """Upload raw PDF bytes to GCS and return the blob path."""
+    ts = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    safe = re.sub(r'[^A-Za-z0-9._-]', '_', Path(original_filename).name)[:80]
+    blob_name = f"uploads/{ts}-{secrets.token_hex(4)}-{safe}"
+    _storage().bucket(UPLOAD_BUCKET).blob(blob_name).upload_from_string(
+        pdf_bytes, content_type="application/pdf"
+    )
+    return blob_name
+
+
 # ── Flask app ──────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_MB * 1024 * 1024
+
+# Set lifecycle rule once when the worker process starts.
+_ensure_lifecycle()
 
 
 @app.get("/")
@@ -145,6 +193,11 @@ def upload():
 
     try:
         pdf_bytes = f.read()
+
+        # Persist the original upload to GCS (auto-deleted after 1 day).
+        _upload_to_gcs(pdf_bytes, f.filename)
+
+        # Process from the same in-memory bytes — no second GCS round-trip needed.
         results, zip_bytes = process_pdf(pdf_bytes)
     except Exception as exc:
         return render_template("index.html", error=f"Processing failed: {exc}", max_mb=MAX_MB)
