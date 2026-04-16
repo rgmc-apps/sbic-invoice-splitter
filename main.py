@@ -7,7 +7,7 @@ import fitz  # PyMuPDF
 from PIL import Image
 from pyzbar import pyzbar as zbar
 
-MAX_MB = 50
+MAX_MB = 500
 TMP_DIR = Path(tempfile.gettempdir()) / "inv_sep"
 TMP_DIR.mkdir(exist_ok=True)
 RESULT_TTL = 3600  # seconds — temp files expire after 1 hour
