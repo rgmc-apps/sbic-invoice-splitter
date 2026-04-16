@@ -17,7 +17,9 @@ except Exception:
     _pyzbar = None  # type: ignore[assignment]
     _ZBAR_OK = False
 
-MAX_MB = 500
+UPLOAD_LIMIT_MB  = int(os.environ.get("UPLOAD_LIMIT_MB",  500))   # soft cap for normal uploads
+OPTIMIZE_LIMIT_MB = int(os.environ.get("OPTIMIZE_LIMIT_MB", 2048))  # hard cap for the optimize-only endpoint
+MAX_MB = UPLOAD_LIMIT_MB   # kept for template compatibility
 UPLOAD_BUCKET = os.environ.get("UPLOAD_BUCKET", "sbic-splitter-uploads")
 TMP_DIR = Path(tempfile.gettempdir()) / "inv_sep"
 TMP_DIR.mkdir(exist_ok=True)
@@ -232,12 +234,21 @@ def _upload_to_gcs(pdf_bytes: bytes, original_filename: str) -> str:
 # ── Flask app ──────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = MAX_MB * 1024 * 1024
+# Set the global hard limit to OPTIMIZE_LIMIT_MB so the /optimize-only
+# endpoint can accept files larger than the normal upload cap.
+# The /upload route enforces UPLOAD_LIMIT_MB itself.
+app.config["MAX_CONTENT_LENGTH"] = OPTIMIZE_LIMIT_MB * 1024 * 1024
 
 # Run lifecycle setup in a daemon thread so it never delays gunicorn's port bind.
 # Cloud Run kills the container if the port isn't ready within the startup timeout;
 # moving this off the critical path ensures the server is always reachable first.
 threading.Thread(target=_ensure_lifecycle, daemon=True).start()
+
+
+@app.errorhandler(413)
+def too_large(e):
+    return render_template("error_413.html", upload_limit_mb=UPLOAD_LIMIT_MB,
+                           optimize_limit_mb=OPTIMIZE_LIMIT_MB), 413
 
 
 @app.get("/healthz")
@@ -248,7 +259,40 @@ def healthz():
 
 @app.get("/")
 def index():
-    return render_template("index.html", max_mb=MAX_MB)
+    return render_template("index.html", max_mb=MAX_MB, upload_limit_mb=UPLOAD_LIMIT_MB)
+
+
+@app.post("/optimize-only")
+def optimize_only():
+    """Accept a PDF (up to OPTIMIZE_LIMIT_MB), compress it, return the optimized file."""
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return render_template("error_413.html", upload_limit_mb=UPLOAD_LIMIT_MB,
+                               optimize_limit_mb=OPTIMIZE_LIMIT_MB,
+                               error="No file provided."), 400
+    if not f.filename.lower().endswith(".pdf"):
+        return render_template("error_413.html", upload_limit_mb=UPLOAD_LIMIT_MB,
+                               optimize_limit_mb=OPTIMIZE_LIMIT_MB,
+                               error="Only PDF files are accepted."), 400
+
+    raw = f.read()
+    optimized = _optimize_pdf(raw)
+    saved_pct = round((len(raw) - len(optimized)) / len(raw) * 100, 1)
+
+    stem = Path(f.filename).stem
+    dl_name = f"{stem}_optimized.pdf"
+
+    resp = send_file(
+        io.BytesIO(optimized),
+        as_attachment=True,
+        download_name=dl_name,
+        mimetype="application/pdf",
+    )
+    # Surface compression stats in response headers for the JS layer
+    resp.headers["X-Original-Size"]  = str(len(raw))
+    resp.headers["X-Optimized-Size"] = str(len(optimized))
+    resp.headers["X-Saved-Pct"]      = str(saved_pct)
+    return resp
 
 
 @app.post("/upload")
@@ -256,9 +300,18 @@ def upload():
     _cleanup_old_files()
     f = request.files.get("file")
     if not f or not f.filename:
-        return render_template("index.html", error="No file selected.", max_mb=MAX_MB)
+        return render_template("index.html", error="No file selected.",
+                               max_mb=MAX_MB, upload_limit_mb=UPLOAD_LIMIT_MB)
     if not f.filename.lower().endswith(".pdf"):
-        return render_template("index.html", error="Only PDF files are accepted.", max_mb=MAX_MB)
+        return render_template("index.html", error="Only PDF files are accepted.",
+                               max_mb=MAX_MB, upload_limit_mb=UPLOAD_LIMIT_MB)
+
+    # Manual soft cap — files between UPLOAD_LIMIT_MB and OPTIMIZE_LIMIT_MB reach
+    # this route because the global Flask limit is OPTIMIZE_LIMIT_MB.
+    content_len = request.content_length or 0
+    if content_len > UPLOAD_LIMIT_MB * 1024 * 1024:
+        return render_template("error_413.html", upload_limit_mb=UPLOAD_LIMIT_MB,
+                               optimize_limit_mb=OPTIMIZE_LIMIT_MB), 413
 
     try:
         raw_bytes = f.read()

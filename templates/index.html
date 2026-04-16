@@ -20,9 +20,10 @@
     .drop-zone label{cursor:pointer;color:var(--navy);font-weight:600;text-decoration:underline}
     .file-name{margin-top:8px;color:var(--muted);font-size:13px}
     .actions{margin-top:14px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-    .btn{background:var(--navy);color:#fff;border:0;border-radius:10px;padding:10px 22px;font-weight:600;cursor:pointer;font-size:15px}
+    .btn{background:var(--navy);color:#fff;border:0;border-radius:10px;padding:10px 22px;font-weight:600;cursor:pointer;font-size:15px;transition:filter .15s}
     .btn:hover{filter:brightness(1.08)}
     .btn:disabled{opacity:.55;cursor:not-allowed}
+    .btn-warn{background:#b45309;color:#fff}
     .badge{display:inline-block;background:var(--sand);color:#2b1900;padding:2px 9px;border-radius:8px;font-size:12px;margin-left:6px}
     .err{color:#b00020;margin-top:12px;padding:10px 14px;background:#fff0f0;border-radius:8px;border:1px solid #f5c6cb;font-size:14px}
     .spinner{display:none;width:22px;height:22px;vertical-align:middle}
@@ -32,6 +33,30 @@
     li{margin-bottom:4px}
     h3{margin:16px 0 6px;font-size:15px}
     code{background:#f0f4f9;padding:1px 5px;border-radius:4px;font-size:13px}
+
+    /* ── size warning banner ── */
+    .size-banner{display:none;margin-top:12px;padding:10px 14px;border-radius:8px;font-size:14px;gap:8px;align-items:flex-start}
+    .size-banner.warn{background:#fff7ed;border:1px solid #fed7aa;color:#92400e;display:flex}
+    .size-banner.error{background:#fff0f0;border:1px solid #f5c6cb;color:#b00020;display:flex}
+
+    /* ── modal overlay ── */
+    .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:100;align-items:center;justify-content:center;padding:20px}
+    .modal-overlay.active{display:flex}
+    .modal{background:#fff;border-radius:16px;padding:28px;max-width:480px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,.2)}
+    .modal h2{margin:0 0 8px;font-size:20px}
+    .modal p{color:var(--muted);font-size:14px;margin:0 0 20px}
+    .modal .size-info{font-size:22px;font-weight:700;color:#b45309;margin-bottom:4px}
+    .modal .limit-info{font-size:13px;color:var(--muted);margin-bottom:20px}
+    .modal-actions{display:flex;gap:10px;flex-wrap:wrap}
+    .modal-actions .btn{flex:1;justify-content:center;display:flex;align-items:center;gap:6px}
+    .opt-progress{display:none;margin-top:16px}
+    .opt-progress.active{display:block}
+    .opt-bar-bg{background:#e5e7eb;border-radius:999px;height:8px;overflow:hidden}
+    .opt-bar{width:0%;height:100%;border-radius:999px;background:linear-gradient(90deg,#0F4C81,#3b82f6);transition:width .3s}
+    .opt-lbl{font-size:13px;color:var(--muted);margin-top:5px}
+    .opt-result{display:none;margin-top:10px;padding:8px 12px;border-radius:8px;font-size:13px}
+    .opt-result.ok{background:#e8f4e8;color:#155724;display:block}
+    .opt-result.err{background:#fde8e8;color:#b00020;display:block}
   </style>
 </head>
 <body>
@@ -54,9 +79,15 @@
       <div class="file-name" id="fileName">No file chosen</div>
     </div>
 
+    <!-- Dynamic size banner (shown by JS) -->
+    <div class="size-banner" id="sizeBanner">
+      <span id="sizeBannerIcon">⚠️</span>
+      <span id="sizeBannerMsg"></span>
+    </div>
+
     <div class="actions">
       <button class="btn" type="submit" id="submitBtn">Process &amp; Split</button>
-      <span class="sub">PDF only &nbsp;·&nbsp; Max {{ max_mb }} MB</span>
+      <span class="sub">PDF only &nbsp;·&nbsp; Max {{ upload_limit_mb }} MB</span>
       <svg class="spinner" id="spinner" viewBox="0 0 50 50">
         <circle cx="25" cy="25" r="20" fill="none" stroke="#0F4C81" stroke-width="5"
                 stroke-dasharray="31.4 94.2" stroke-linecap="round">
@@ -77,7 +108,7 @@
       <li>Upload a multi-page PDF containing multiple sales invoices.</li>
       <li>Each page is split into its own PDF file.</li>
       <li>The SI number is automatically read from the text under the barcode or near the lower-right corner of each page.</li>
-      <li>Download a ZIP containing all individual PDFs, each named <code>&lt;SI-Number&gt;.pdf</code>.</li>
+      <li>Download a ZIP containing all individual PDFs, each named <code>SI_{code}_{number}.pdf</code>.</li>
     </ol>
 
     <h3>Extraction methods (tried in order)</h3>
@@ -91,43 +122,192 @@
 
     <h3>File requirements</h3>
     <ul>
-      <li>PDF only &nbsp;·&nbsp; Max <b>{{ max_mb }} MB</b></li>
-      <li>Text-based PDFs give the best and fastest results.</li>
-      <li>Scanned PDFs are supported via barcode decoding.</li>
+      <li>PDF only &nbsp;·&nbsp; Max <b>{{ upload_limit_mb }} MB</b> per upload</li>
+      <li>Files are automatically optimized before processing.</li>
+      <li>If your file exceeds the limit, use the <b>Optimize</b> button to compress it first.</li>
       <li>Password-protected PDFs are not supported.</li>
     </ul>
   </div>
 </div>
 
-<script>
-  const drop   = document.getElementById('dropZone');
-  const input  = document.getElementById('fileInput');
-  const label  = document.getElementById('fileName');
-  const form   = document.getElementById('upForm');
-  const btn    = document.getElementById('submitBtn');
-  const spin   = document.getElementById('spinner');
+<!-- ── Too-large modal ── -->
+<div class="modal-overlay" id="modalOverlay">
+  <div class="modal">
+    <h2>File Too Large</h2>
+    <div class="size-info" id="modalFileSize"></div>
+    <div class="limit-info" id="modalLimitInfo"></div>
+    <p>You can optimize (compress) the file here — it's lossless, visual quality is unchanged — then re-upload the smaller version.</p>
 
-  input.addEventListener('change', () => {
-    label.textContent = input.files[0]?.name ?? 'No file chosen';
-  });
+    <div class="modal-actions">
+      <button class="btn btn-warn" id="modalOptBtn">
+        <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24">
+          <path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/>
+        </svg>
+        Optimize &amp; Download
+      </button>
+      <button class="btn" style="background:#6b7280" id="modalCancelBtn">Cancel</button>
+    </div>
+
+    <div class="opt-progress" id="optProgress">
+      <div class="opt-bar-bg"><div class="opt-bar" id="optBar"></div></div>
+      <div class="opt-lbl" id="optLbl">Uploading…</div>
+    </div>
+    <div class="opt-result" id="optResult"></div>
+  </div>
+</div>
+
+<script>
+  const UPLOAD_LIMIT_MB = {{ upload_limit_mb }};
+  const WARN_MB         = Math.min(100, UPLOAD_LIMIT_MB * 0.5); // warn at 50% of limit
+
+  const drop      = document.getElementById('dropZone');
+  const input     = document.getElementById('fileInput');
+  const fileLabel = document.getElementById('fileName');
+  const form      = document.getElementById('upForm');
+  const submitBtn = document.getElementById('submitBtn');
+  const spin      = document.getElementById('spinner');
+  const banner    = document.getElementById('sizeBanner');
+  const bannerMsg = document.getElementById('sizeBannerMsg');
+  const overlay   = document.getElementById('modalOverlay');
+
+  // Modal elements
+  const modalFileSize  = document.getElementById('modalFileSize');
+  const modalLimitInfo = document.getElementById('modalLimitInfo');
+  const modalOptBtn    = document.getElementById('modalOptBtn');
+  const modalCancelBtn = document.getElementById('modalCancelBtn');
+  const optProgress    = document.getElementById('optProgress');
+  const optBar         = document.getElementById('optBar');
+  const optLbl         = document.getElementById('optLbl');
+  const optResult      = document.getElementById('optResult');
+
+  function fmt(bytes) {
+    return bytes >= 1048576
+      ? (bytes / 1048576).toFixed(2) + ' MB'
+      : (bytes / 1024).toFixed(1) + ' KB';
+  }
+
+  function onFileSelected(file) {
+    if (!file) return;
+    const sizeMB = file.size / 1048576;
+    fileLabel.textContent = `${file.name} (${fmt(file.size)})`;
+
+    banner.className = 'size-banner';
+    banner.style.display = 'none';
+    submitBtn.disabled = false;
+
+    if (sizeMB > UPLOAD_LIMIT_MB) {
+      // Blocking — show modal
+      submitBtn.disabled = true;
+      showTooLargeModal(file, sizeMB);
+    } else if (sizeMB > WARN_MB) {
+      // Warning banner — upload will still work (server auto-optimizes)
+      banner.className = 'size-banner warn';
+      bannerMsg.textContent =
+        `Large file detected (${sizeMB.toFixed(1)} MB). It will be automatically optimized before processing — this may take a moment.`;
+    }
+  }
+
+  function showTooLargeModal(file, sizeMB) {
+    modalFileSize.textContent  = fmt(file.size);
+    modalLimitInfo.textContent = `Upload limit: ${UPLOAD_LIMIT_MB} MB — your file is ${sizeMB.toFixed(1)} MB`;
+    optProgress.classList.remove('active');
+    optBar.style.width = '0%';
+    optResult.className = 'opt-result';
+    optResult.textContent = '';
+    modalOptBtn.disabled = false;
+    modalOptBtn.textContent = '';
+    modalOptBtn.innerHTML = `
+      <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24">
+        <path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/>
+      </svg> Optimize &amp; Download`;
+    overlay.classList.add('active');
+
+    modalOptBtn.onclick = () => runOptimize(file);
+    modalCancelBtn.onclick = () => {
+      overlay.classList.remove('active');
+      // Reset file input so user must re-select
+      input.value = '';
+      fileLabel.textContent = 'No file chosen';
+      submitBtn.disabled = false;
+    };
+  }
+
+  async function runOptimize(file) {
+    modalOptBtn.disabled = true;
+    optProgress.classList.add('active');
+    optBar.style.width = '0%';
+    optLbl.textContent = 'Uploading…';
+    optResult.className = 'opt-result';
+
+    const fd = new FormData();
+    fd.append('file', file);
+
+    try {
+      const xhr = await new Promise((resolve, reject) => {
+        const x = new XMLHttpRequest();
+        x.open('POST', '/optimize-only');
+        x.responseType = 'blob';
+        x.upload.addEventListener('progress', e => {
+          if (e.lengthComputable) {
+            const pct = Math.round(e.loaded / e.total * 65);
+            optBar.style.width = pct + '%';
+            optLbl.textContent = `Uploading… ${pct}%`;
+          }
+        });
+        x.addEventListener('load', () => x.status === 200 ? resolve(x) : reject(new Error(`Error ${x.status}`)));
+        x.addEventListener('error', () => reject(new Error('Network error')));
+        x.send(fd);
+      });
+
+      optBar.style.width = '90%';
+      optLbl.textContent = 'Compressing…';
+
+      const origSize = parseInt(xhr.getResponseHeader('X-Original-Size')  || '0');
+      const optSize  = parseInt(xhr.getResponseHeader('X-Optimized-Size') || '0');
+      const saved    = xhr.getResponseHeader('X-Saved-Pct') || '?';
+
+      const url  = URL.createObjectURL(xhr.response);
+      const stem = file.name.replace(/\.pdf$/i, '');
+      const a    = document.createElement('a');
+      a.href = url; a.download = `${stem}_optimized.pdf`;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+
+      optBar.style.width = '100%';
+      optLbl.textContent = 'Done!';
+      optResult.className = 'opt-result ok';
+      optResult.textContent =
+        `✓ ${fmt(origSize)} → ${fmt(optSize)} (−${saved}%). Download started. Close this and re-upload the optimized file.`;
+      modalOptBtn.disabled = false;
+
+    } catch (err) {
+      optBar.style.width = '0%';
+      optResult.className = 'opt-result err';
+      optResult.textContent = `✗ ${err.message}. Please try again.`;
+      modalOptBtn.disabled = false;
+    }
+  }
+
+  // ── Event wiring ──
+  input.addEventListener('change', () => onFileSelected(input.files[0]));
 
   drop.addEventListener('dragover',  e => { e.preventDefault(); drop.classList.add('dragover'); });
-  drop.addEventListener('dragleave', ()=> drop.classList.remove('dragover'));
+  drop.addEventListener('dragleave', ()  => drop.classList.remove('dragover'));
   drop.addEventListener('drop', e => {
-    e.preventDefault();
-    drop.classList.remove('dragover');
-    const file = e.dataTransfer.files[0];
-    if (file) {
-      const dt = new DataTransfer();
-      dt.items.add(file);
-      input.files = dt.files;
-      label.textContent = file.name;
-    }
+    e.preventDefault(); drop.classList.remove('dragover');
+    const f = e.dataTransfer.files[0];
+    if (f) { const dt = new DataTransfer(); dt.items.add(f); input.files = dt.files; onFileSelected(f); }
   });
 
-  form.addEventListener('submit', () => {
-    btn.disabled = true;
-    btn.textContent = 'Processing…';
+  form.addEventListener('submit', e => {
+    const f = input.files[0];
+    if (f && f.size / 1048576 > UPLOAD_LIMIT_MB) {
+      e.preventDefault();
+      showTooLargeModal(f, f.size / 1048576);
+      return;
+    }
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Processing…';
     spin.classList.add('active');
   });
 </script>
