@@ -306,7 +306,8 @@ def _generate_upload_url(blob_name: str) -> str:
 
 
 def _save_result(results: list[dict], zip_bytes: bytes,
-                 original_size: int, optimized_size: int) -> str:
+                 original_size: int, optimized_size: int,
+                 original_filename: str = "upload") -> str:
     token = secrets.token_urlsafe(24)
 
     # Upload ZIP to GCS so any Cloud Run instance can serve the download.
@@ -315,12 +316,17 @@ def _save_result(results: list[dict], zip_bytes: bytes,
         zip_bytes, content_type="application/zip"
     )
 
+    # Derive the download filename: strip extension, sanitize, append suffix.
+    stem = re.sub(r'[\\/*?:"<>|\r\n\t]', '_', Path(original_filename).stem).strip().strip('._') or "invoices"
+    download_name = f"{stem}_invoices.zip"
+
     # Keep a local JSON sidecar for the result page (tiny, fast).
     (TMP_DIR / f"{token}.json").write_text(json.dumps({
         "results": results,
         "original_size": original_size,
         "optimized_size": optimized_size,
         "zip_blob": zip_blob_name,
+        "download_name": download_name,
     }))
     return token
 
@@ -435,7 +441,7 @@ def process():
             "detail": traceback.format_exc(),
         }), 500
 
-    token = _save_result(results, zip_bytes, original_size, optimized_size)
+    token = _save_result(results, zip_bytes, original_size, optimized_size, filename)
     return jsonify({"token": token})
 
 
@@ -490,6 +496,7 @@ def download(token: str):
     zip_blob_name = meta.get("zip_blob")
     if not zip_blob_name:
         abort(404)
+    download_name = meta.get("download_name", "invoices.zip")
 
     # Generate a short-lived signed URL and redirect the browser to it.
     try:
@@ -500,7 +507,7 @@ def download(token: str):
             version="v4",
             expiration=datetime.timedelta(minutes=15),
             method="GET",
-            response_disposition='attachment; filename="invoices.zip"',
+            response_disposition=f'attachment; filename="{download_name}"',
             service_account_email=credentials.service_account_email,
             access_token=credentials.token,
         )
