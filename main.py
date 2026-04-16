@@ -6,7 +6,16 @@ from flask import Flask, abort, redirect, render_template, request, send_file, u
 import fitz  # PyMuPDF
 from google.cloud import storage as gcs
 from PIL import Image
-from pyzbar import pyzbar as zbar
+
+# pyzbar needs the native libzbar0 shared library.
+# Import it optionally so a missing system library doesn't crash startup;
+# barcode detection is simply skipped when unavailable.
+try:
+    from pyzbar import pyzbar as _pyzbar
+    _ZBAR_OK = True
+except Exception:
+    _pyzbar = None  # type: ignore[assignment]
+    _ZBAR_OK = False
 
 MAX_MB = 500
 UPLOAD_BUCKET = os.environ.get("UPLOAD_BUCKET", "sbic-splitter-uploads")
@@ -80,23 +89,24 @@ def _extract_si(doc: fitz.Document, idx: int) -> tuple[str, str]:
     if si:
         return si, "text-full"
 
-    # 4. Barcode decode — render bottom half at 2× scale using pdfium
-    try:
-        mat = fitz.Matrix(2, 2)
-        pix = page.get_pixmap(matrix=mat, clip=fitz.Rect(0, h * 0.50, w, h), colorspace=fitz.csGRAY)
-        img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
-        codes = zbar.decode(img)
-        if not codes:
-            # Retry on full page at 1.5×
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), colorspace=fitz.csGRAY)
+    # 4. Barcode decode — render bottom half at 2× scale (only when libzbar0 is present)
+    if _ZBAR_OK:
+        try:
+            mat = fitz.Matrix(2, 2)
+            pix = page.get_pixmap(matrix=mat, clip=fitz.Rect(0, h * 0.50, w, h), colorspace=fitz.csGRAY)
             img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
-            codes = zbar.decode(img)
-        for code in codes:
-            data = code.data.decode("utf-8", errors="ignore").strip()
-            if data:
-                return _sanitize(data), "barcode"
-    except Exception:
-        pass
+            codes = _pyzbar.decode(img)
+            if not codes:
+                # Retry on full page at 1.5×
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), colorspace=fitz.csGRAY)
+                img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+                codes = _pyzbar.decode(img)
+            for code in codes:
+                data = code.data.decode("utf-8", errors="ignore").strip()
+                if data:
+                    return _sanitize(data), "barcode"
+        except Exception:
+            pass
 
     return f"page_{idx + 1:04d}", "fallback"
 
@@ -199,6 +209,12 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_MB * 1024 * 1024
 # Cloud Run kills the container if the port isn't ready within the startup timeout;
 # moving this off the critical path ensures the server is always reachable first.
 threading.Thread(target=_ensure_lifecycle, daemon=True).start()
+
+
+@app.get("/healthz")
+def healthz():
+    """Lightweight health check used by Cloud Run startup/liveness probes."""
+    return {"status": "ok", "zbar": _ZBAR_OK}, 200
 
 
 @app.get("/")
