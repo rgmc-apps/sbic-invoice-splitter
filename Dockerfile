@@ -16,5 +16,5 @@ ENV PORT=8080
 EXPOSE 8080
 
 # 1 worker + 8 threads suits Cloud Run's per-instance concurrency.
-# Timeout 300s to accommodate large PDFs.
-CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 300 main:app
+# Timeout 300s and unlimited body size to accommodate large PDFs.
+CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 300 --limit-request-body 0 main:app
