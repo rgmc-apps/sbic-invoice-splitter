@@ -1,5 +1,5 @@
 from __future__ import annotations
-import datetime, io, json, os, re, secrets, tempfile, threading, time, zipfile
+import datetime, io, json, os, re, secrets, tempfile, threading, time, traceback, zipfile
 from pathlib import Path
 from flask import Flask, abort, jsonify, redirect, render_template, request, send_file, url_for
 
@@ -288,15 +288,57 @@ def process():
     if not blob_name:
         return jsonify({"error": "blob_name is required"}), 400
 
+    # ── Step A: download from GCS ──────────────────────────────────────────────
     try:
         pdf_bytes     = _storage().bucket(UPLOAD_BUCKET).blob(blob_name).download_as_bytes()
         original_size = len(pdf_bytes)
-        customer_code = _resolve_customer_code(filename)
-        pdf_bytes     = _optimize_pdf(pdf_bytes)
-        optimized_size = len(pdf_bytes)
-        results, zip_bytes = process_pdf(pdf_bytes, customer_code)
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        return jsonify({
+            "error":  f"Failed to download file from cloud storage: {exc}",
+            "cause":  "gcs_download",
+            "hint":   "The upload may have failed or the signed URL expired. Try uploading again.",
+            "detail": traceback.format_exc(),
+        }), 502
+
+    # ── Step B: lossless optimisation ─────────────────────────────────────────
+    try:
+        customer_code  = _resolve_customer_code(filename)
+        pdf_bytes      = _optimize_pdf(pdf_bytes)
+        optimized_size = len(pdf_bytes)
+    except MemoryError:
+        return jsonify({
+            "error":  "Out of memory while optimising the PDF.",
+            "cause":  "oom_optimize",
+            "hint":   "The file is too large for the current Cloud Run memory limit. "
+                      "Increase the instance memory to 2 GB or higher in the Cloud Run service settings.",
+            "detail": traceback.format_exc(),
+        }), 500
+    except Exception as exc:
+        return jsonify({
+            "error":  f"PDF optimisation failed: {exc}",
+            "cause":  "optimization",
+            "hint":   "The file may be corrupt or password-protected.",
+            "detail": traceback.format_exc(),
+        }), 500
+
+    # ── Step C: split pages ────────────────────────────────────────────────────
+    try:
+        results, zip_bytes = process_pdf(pdf_bytes, customer_code)
+    except MemoryError:
+        return jsonify({
+            "error":  "Out of memory while splitting the PDF.",
+            "cause":  "oom_split",
+            "hint":   "The file is too large for the current Cloud Run memory limit. "
+                      "Increase the instance memory to 2 GB or higher in the Cloud Run service settings.",
+            "detail": traceback.format_exc(),
+        }), 500
+    except Exception as exc:
+        return jsonify({
+            "error":  f"PDF splitting failed: {exc}",
+            "cause":  "split",
+            "hint":   "The PDF may be corrupt, encrypted, or contain unsupported content.",
+            "detail": traceback.format_exc(),
+        }), 500
 
     token = _save_result(results, zip_bytes, original_size, optimized_size)
     return jsonify({"token": token})
