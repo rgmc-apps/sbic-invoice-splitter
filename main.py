@@ -14,6 +14,26 @@ TMP_DIR = Path(tempfile.gettempdir()) / "inv_sep"
 TMP_DIR.mkdir(exist_ok=True)
 RESULT_TTL = 3600  # seconds — local temp files expire after 1 hour
 
+# ── Customer-code mapping ──────────────────────────────────────────────────────
+# Maps a keyword found in the uploaded filename (case-insensitive) to the
+# customer's SI code used in the output filename prefix.
+# To add a new customer: insert a new entry below — no other code changes needed.
+_CUSTOMER_CODES: dict[str, str] = {
+    "MTC":  "240762",
+    "SBIC": "190275",
+}
+
+
+def _resolve_customer_code(filename: str) -> str:
+    """Return the SI customer code whose key appears in *filename* (stem only).
+    Falls back to 'UNKNOWN' if no mapping key is found."""
+    stem = Path(filename).stem.upper()
+    for key, code in _CUSTOMER_CODES.items():
+        if key in stem:
+            return code
+    return "UNKNOWN"
+
+
 # ── SI-number extraction patterns ─────────────────────────────────────────────
 # Philippine sales invoices typically show "SI No.: XXXXXXXX" or a bare number
 # printed under a barcode near the lower-right corner of the page.
@@ -81,8 +101,9 @@ def _extract_si(doc: fitz.Document, idx: int) -> tuple[str, str]:
     return f"page_{idx + 1:04d}", "fallback"
 
 
-def process_pdf(pdf_bytes: bytes) -> tuple[list[dict], bytes]:
-    """Split every page into its own PDF, name each by SI number, return ZIP bytes."""
+def process_pdf(pdf_bytes: bytes, customer_code: str) -> tuple[list[dict], bytes]:
+    """Split every page into its own PDF named SI_{customer_code}_{si_number}.pdf,
+    return (results_list, zip_bytes)."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     results: list[dict] = []
     used: dict[str, int] = {}
@@ -92,7 +113,7 @@ def process_pdf(pdf_bytes: bytes) -> tuple[list[dict], bytes]:
         for i in range(doc.page_count):
             si, method = _extract_si(doc, i)
 
-            # Deduplicate: append _2, _3 … for repeated SI values
+            # Deduplicate: append _2, _3 … for repeated SI numbers on different pages
             base = si
             if base in used:
                 used[base] += 1
@@ -105,7 +126,8 @@ def process_pdf(pdf_bytes: bytes) -> tuple[list[dict], bytes]:
             page_bytes = single.tobytes(deflate=True)
             single.close()
 
-            filename = f"{si}.pdf"
+            # Output format: SI_{customer_code}_{si_number}.pdf
+            filename = f"SI_{customer_code}_{si}.pdf"
             zf.writestr(filename, page_bytes)
             results.append({"page": i + 1, "si": si, "filename": filename, "method": method})
 
@@ -193,12 +215,13 @@ def upload():
 
     try:
         pdf_bytes = f.read()
+        customer_code = _resolve_customer_code(f.filename)
 
         # Persist the original upload to GCS (auto-deleted after 1 day).
         _upload_to_gcs(pdf_bytes, f.filename)
 
         # Process from the same in-memory bytes — no second GCS round-trip needed.
-        results, zip_bytes = process_pdf(pdf_bytes)
+        results, zip_bytes = process_pdf(pdf_bytes, customer_code)
     except Exception as exc:
         return render_template("index.html", error=f"Processing failed: {exc}", max_mb=MAX_MB)
 
