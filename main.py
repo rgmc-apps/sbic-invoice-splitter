@@ -46,11 +46,22 @@ def _resolve_customer_code(filename: str) -> str:
 
 
 # ── SI-number extraction patterns ─────────────────────────────────────────────
+# Tried in order — first match wins.
 _SI_RE = [
-    re.compile(r'\bS\.?I\.?\s*(?:No\.?|Num(?:ber)?|#|:)?\s*[:\-]?\s*([A-Z0-9]{4,}(?:[-]\d+)*)', re.I),
-    re.compile(r'(?:Sales\s+Invoice|Invoice)\s*(?:No\.?|#|:)?\s*([A-Z0-9]{5,20})', re.I),
+    # 1. Explicit "SI No:" / "S.I. No:" / "S.I. NO:" label (with optional dot/space variants)
+    re.compile(r'\bS\.?\s*I\.?\s*[Nn][Oo]\.?\s*:?\s*([A-Z0-9]{4,}(?:[-/]\d+)*)', re.I),
+    # 2. Bare "NO:" at the start of a line or after whitespace — common shorthand on
+    #    invoice bodies where the SI context is already implied by the surrounding text.
+    #    Using MULTILINE + start-of-line anchor prevents false matches on "PO NO:", etc.
+    re.compile(r'(?:^|(?<=\s))NO\s*:\s*([A-Z0-9]{4,}(?:[-/]\d+)*)', re.I | re.MULTILINE),
+    # 3. "Sales Invoice No." / "Invoice No."
+    re.compile(r'(?:Sales\s+Invoice|Invoice)\s*[Nn]o\.?\s*[:\-]?\s*([A-Z0-9]{5,20})', re.I),
+    # 4. Generic S.I. with optional number keyword (legacy broad match)
+    re.compile(r'\bS\.?I\.?\s*(?:Num(?:ber)?|#)\s*[:\-]?\s*([A-Z0-9]{4,}(?:[-]\d+)*)', re.I),
+    # 5. Bare "SI-NNNN" token
     re.compile(r'\b(SI[-]\d{4,}(?:[-]\d+)*)\b', re.I),
-    re.compile(r'\b(\d{7,13})\b'),  # long bare numeric — last resort
+    # 6. Long bare numeric — last resort
+    re.compile(r'\b(\d{7,13})\b'),
 ]
 
 
@@ -59,8 +70,11 @@ def _sanitize(name: str) -> str:
 
 
 def _find_si(text: str) -> str | None:
+    # Collapse newlines so label/value pairs split across lines still match
+    # (e.g. "SI No:\n123456" → "SI No: 123456").
+    normalized = re.sub(r'[ \t]*[\r\n]+[ \t]*', ' ', text).strip()
     for pat in _SI_RE:
-        m = pat.search(text)
+        m = pat.search(normalized)
         if m:
             v = m.group(1).strip()
             return _sanitize(v) if v else None
