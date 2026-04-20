@@ -239,36 +239,57 @@ def _page_text(doc: fitz.Document, idx: int, clip: fitz.Rect | None = None) -> s
 
 
 def _ocr_text(page: fitz.Page, clip: fitz.Rect | None = None, psm: int = 11) -> str:
-    """Render a page region to pixels at 3× zoom and run Tesseract OCR on it.
+    """Render a page region to pixels and run Tesseract OCR on it.
 
-    This completely bypasses the PDF font-encoding layer, making it the only
-    reliable approach when invoices use custom glyph-to-Unicode mappings that
-    cause get_text() to return garbled output (e.g. "U:rrr&?8s" instead of
-    "Nº 51285").  Returns an empty string if Tesseract is unavailable or fails.
+    Bypasses the PDF font-encoding layer entirely — the only reliable approach
+    when invoices use custom glyph-to-Unicode mappings that cause get_text()
+    to return garbled output (e.g. "U:rrr&?8s" instead of "Nº 51285").
 
     psm controls Tesseract's page-segmentation mode:
       6 = single uniform text block (best for small crop regions)
      11 = sparse text, find as much as possible (best for large/full-page regions)
+
+    Image pipeline (applied before Tesseract):
+      1. 4× zoom for clip regions, 3× for full-page — more pixels let Tesseract
+         distinguish digit shapes that look similar at low resolution (9 vs 6,
+         5 vs 8, etc.).
+      2. Unsharp mask — sharpens edges with controlled radius; better than the
+         basic SHARPEN filter at preserving stroke details on small numerals.
+      3. Contrast ×2 — darkens ink, lightens background.
+      4. Binarization — converts the gray-gradient result to pure black/white.
+         Mid-gray pixels are what cause 9↔6 and 5↔8 digit confusion; a hard
+         threshold eliminates them.
     """
     if not _TESS_OK:
         return ""
     try:
-        mat = fitz.Matrix(3, 3)  # 3× zoom → ~216 DPI for A4/Letter
+        # Higher zoom for focused clip regions — descenders ("9") and ascenders
+        # ("6") become clearly distinct at 4× vs ambiguous at 3×.
+        zoom = 4 if clip is not None else 3
+        mat = fitz.Matrix(zoom, zoom)
         px_kwargs: dict = {"matrix": mat, "colorspace": fitz.csGRAY}
         if clip is not None:
             px_kwargs["clip"] = clip
         pix = page.get_pixmap(**px_kwargs)
         img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
 
-        # Sharpen edges, then boost contrast — both improve digit recognition
-        # on invoice text that may be printed small or at low contrast.
-        img = img.filter(ImageFilter.SHARPEN)
+        # Unsharp mask: radius=2 sharpens thin digit strokes without
+        # over-amplifying noise; percent=150 is a moderate gain.
+        img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
         img = ImageEnhance.Contrast(img).enhance(2.0)
 
-        raw = _pytesseract.image_to_string(img, config=f"--oem 1 --psm {psm}")
+        # Binarize: pixels above 140 → white (background), below → black (ink).
+        # Threshold 140 (slightly above 128) handles light-gray invoice
+        # backgrounds without swallowing thin stroke tails on digits like "9".
+        img = img.point(lambda p: 255 if p > 140 else 0)
+
+        # load_system_dawg=0 / load_freq_dawg=0: disable word-frequency and
+        # dictionary lookups so Tesseract relies purely on character shape
+        # rather than word-completion heuristics that can corrupt lone numerals.
+        config = f"--oem 1 --psm {psm} -c load_system_dawg=0 -c load_freq_dawg=0"
+        raw = _pytesseract.image_to_string(img, config=config)
 
         # Correct common letter-for-digit OCR mistakes (e.g. "S"→"5", "O"→"0")
-        # before the text is passed to the SI-number regex patterns.
         return _ocr_clean(raw)
     except Exception:
         return ""
