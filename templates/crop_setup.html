@@ -4,62 +4,92 @@
   <meta charset="utf-8" />
   <title>Configure SI Crop Region — Invoice Separator</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/cropperjs/dist/cropper.min.css" />
   <style>
-    :root{ --navy:#0F4C81; --sand:#E2A867; --ink:#0b1220; --muted:#667085; --bg:#F7F9FC; --card:#FFFFFF; --border:#E5E7EB; --green:#16a34a; --red:#dc2626; }
-    *{box-sizing:border-box}
-    body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
-    .wrap{max-width:960px;margin:40px auto;padding:0 20px}
-    .header{display:flex;gap:14px;align-items:center;margin-bottom:10px}
-    .logo{width:44px;height:44px;border-radius:12px;object-fit:contain;background:#fff;border:1px solid var(--border);padding:4px}
-    h1{margin:0;font-size:24px}
-    .sub{color:var(--muted);margin:4px 0 20px}
-    .back{display:inline-flex;align-items:center;gap:6px;color:var(--navy);text-decoration:none;font-size:14px;margin-bottom:18px;font-weight:600}
-    .back:hover{text-decoration:underline}
-    .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:22px;box-shadow:0 6px 16px rgba(15,76,129,.08);margin-bottom:16px}
-    h2{margin:0 0 10px;font-size:18px}
-    p{margin:0 0 12px;color:var(--muted);font-size:14px}
+    :root{
+      --navy:#0F4C81; --sand:#E2A867; --ink:#0b1220; --muted:#667085;
+      --bg:#F7F9FC; --card:#FFFFFF; --border:#E5E7EB;
+      --green:#16a34a; --red:#dc2626; --amber:#d97706;
+    }
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+    .wrap{max-width:980px;margin:36px auto;padding:0 20px}
 
-    /* ── Upload zone ── */
-    .drop-zone{border:2px dashed rgba(15,76,129,.30);border-radius:12px;padding:36px 20px;background:#fbfdff;text-align:center;transition:border-color .2s,background .2s;cursor:pointer}
+    /* ── header ── */
+    .back{display:inline-flex;align-items:center;gap:6px;color:var(--navy);text-decoration:none;font-size:14px;font-weight:600;margin-bottom:18px}
+    .back:hover{text-decoration:underline}
+    .header{display:flex;gap:14px;align-items:center;margin-bottom:20px}
+    .logo{width:44px;height:44px;border-radius:12px;object-fit:contain;background:#fff;border:1px solid var(--border);padding:4px}
+    h1{font-size:24px}
+    .sub{color:var(--muted);font-size:14px;margin-top:2px}
+
+    /* ── cards ── */
+    .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:22px;box-shadow:0 4px 14px rgba(15,76,129,.07);margin-bottom:16px}
+    .card h2{font-size:17px;margin-bottom:10px}
+    .card p{color:var(--muted);font-size:14px;margin-bottom:12px}
+
+    /* ── status banner ── */
+    .banner{border-radius:10px;padding:13px 16px;font-size:14px;margin-bottom:16px;display:flex;align-items:flex-start;gap:10px}
+    .banner-warn{background:#fffbeb;border:1px solid #fcd34d;color:#92400e}
+    .banner-ok{background:#f0fdf4;border:1px solid #86efac;color:#166534}
+    .banner svg{flex-shrink:0;margin-top:1px}
+
+    /* ── upload zone ── */
+    .drop-zone{border:2px dashed rgba(15,76,129,.28);border-radius:12px;padding:32px 20px;background:#fbfdff;text-align:center;cursor:pointer;transition:border-color .2s,background .2s}
     .drop-zone.dragover{border-color:var(--navy);background:#eef4fc}
     .drop-zone input[type=file]{display:none}
     .drop-zone label{cursor:pointer;color:var(--navy);font-weight:600;text-decoration:underline}
-    .file-name{margin-top:8px;color:var(--muted);font-size:13px}
+    .file-name{margin-top:6px;color:var(--muted);font-size:13px}
 
-    /* ── Buttons ── */
-    .btn{background:var(--navy);color:#fff;border:0;border-radius:10px;padding:10px 22px;font-weight:600;cursor:pointer;font-size:15px;transition:filter .15s;display:inline-block}
+    /* ── buttons ── */
+    .btn{border:0;border-radius:9px;padding:9px 20px;font-weight:600;cursor:pointer;font-size:14px;transition:filter .15s;display:inline-flex;align-items:center;gap:6px}
     .btn:hover:not(:disabled){filter:brightness(1.08)}
-    .btn:disabled{opacity:.5;cursor:not-allowed}
-    .btn-sm{padding:7px 16px;font-size:13px;border-radius:8px}
-    .btn-danger{background:var(--red)}
-    .btn-success{background:var(--green)}
+    .btn:disabled{opacity:.45;cursor:not-allowed}
+    .btn-primary{background:var(--navy);color:#fff}
+    .btn-success{background:var(--green);color:#fff;font-size:15px;padding:10px 26px}
+    .btn-ghost{background:#e5e7eb;color:var(--ink)}
+    .btn-danger{background:var(--red);color:#fff}
     .btn-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px}
 
-    /* ── Cropper area ── */
-    #cropperSection{display:none}
-    .cropper-wrap{max-height:600px;overflow:hidden;border-radius:10px;border:1px solid var(--border);background:#111}
-    .cropper-wrap img{display:block;max-width:100%}
-    .crop-hint{font-size:13px;color:var(--muted);margin-top:8px}
+    /* ── status messages ── */
+    .msg{margin-top:10px;padding:10px 14px;border-radius:8px;font-size:13px;display:none}
+    .msg.ok{background:#f0fdf4;border:1px solid #86efac;color:#166534}
+    .msg.err{background:#fff0f0;border:1px solid #fca5a5;color:var(--red)}
+    .msg.info{background:#eff6ff;border:1px solid #93c5fd;color:#1d4ed8}
 
-    /* ── Status / feedback ── */
-    .status-box{margin-top:12px;padding:12px 16px;border-radius:8px;font-size:14px;display:none}
-    .status-box.ok{background:#f0fdf4;border:1px solid #86efac;color:#166534}
-    .status-box.err{background:#fff0f0;border:1px solid #fca5a5;color:var(--red)}
-    .status-box.info{background:#eff6ff;border:1px solid #93c5fd;color:#1d4ed8}
-
-    /* ── Current region display ── */
-    .region-badge{display:inline-flex;align-items:center;gap:8px;background:#eff6ff;border:1px solid #93c5fd;color:#1d4ed8;border-radius:8px;padding:8px 14px;font-size:13px;font-family:monospace}
-    .region-none{color:var(--muted);font-size:14px;font-style:italic}
-
-    /* ── Loading spinner ── */
-    .spinner{display:inline-block;width:18px;height:18px;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:6px}
+    /* ── spinner ── */
+    .spinner{display:inline-block;width:16px;height:16px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;animation:spin .65s linear infinite}
     @keyframes spin{to{transform:rotate(360deg)}}
 
-    /* ── Steps ── */
-    .steps{counter-reset:step;list-style:none;padding:0;margin:0 0 12px}
-    .steps li{counter-increment:step;display:flex;align-items:flex-start;gap:10px;margin-bottom:8px;font-size:14px}
-    .steps li::before{content:counter(step);background:var(--navy);color:#fff;border-radius:50%;width:22px;height:22px;min-width:22px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;margin-top:1px}
+    /* ── numbered steps ── */
+    .steps{list-style:none;margin:0 0 14px}
+    .steps li{display:flex;align-items:flex-start;gap:10px;margin-bottom:7px;font-size:14px;color:var(--muted)}
+    .step-num{background:var(--navy);color:#fff;border-radius:50%;width:22px;height:22px;min-width:22px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;margin-top:1px}
+
+    /* ── canvas crop area ── */
+    #cropSection{display:none}
+    .canvas-wrap{
+      position:relative;border-radius:10px;overflow:hidden;
+      border:1px solid var(--border);background:#1e293b;
+      cursor:crosshair;user-select:none;-webkit-user-select:none;
+      /* constrain height on small screens */
+      max-height:72vh;
+    }
+    #cropCanvas{display:block;width:100%;height:auto;touch-action:none}
+    .canvas-hint{font-size:12px;color:var(--muted);margin-top:6px;text-align:center}
+
+    /* ── region info bar ── */
+    .region-info{
+      display:flex;align-items:center;gap:12px;margin-top:12px;
+      padding:10px 14px;background:#f8fafc;border:1px solid var(--border);
+      border-radius:8px;font-size:13px;flex-wrap:wrap
+    }
+    .region-info .lbl{color:var(--muted);margin-right:2px}
+    .region-info .val{font-weight:700;color:var(--navy);font-family:monospace}
+    #noSelMsg{color:var(--muted);font-style:italic;font-size:13px}
+
+    /* ── saved region display ── */
+    .region-badge{display:inline-flex;align-items:center;gap:8px;background:#eff6ff;border:1px solid #93c5fd;color:#1d4ed8;border-radius:8px;padding:8px 14px;font-size:13px;font-family:monospace}
+    .region-none{color:var(--muted);font-size:14px;font-style:italic}
   </style>
 </head>
 <body>
@@ -71,272 +101,546 @@
     <img class="logo" src="/static/logo.png" alt="RGMC Logo" onerror="this.style.display='none'">
     <div>
       <h1>Configure SI Crop Region</h1>
-      <div class="sub">Define the exact area of the page where the Sales Invoice number is printed.</div>
+      <div class="sub">Pinpoint the exact area where the Sales Invoice number appears on your invoices.</div>
     </div>
   </div>
 
-  <!-- Current Region Status -->
-  <div class="card">
+  <!-- Current region status -->
+  <div class="card" id="currentCard">
     <h2>Current Region</h2>
-    <div id="currentRegionDisplay">
-      {% if current_crop != "null" %}
-        <div class="region-badge" id="regionBadge">
-          &#10003;&nbsp; Active &nbsp;|&nbsp;
-          x: <b id="rx1"></b>–<b id="rx2"></b> &nbsp; y: <b id="ry1"></b>–<b id="ry2"></b>
-        </div>
-        <div class="btn-row" style="margin-top:10px">
-          <button class="btn btn-sm btn-danger" id="disableBtn">Disable crop region</button>
-        </div>
-      {% else %}
-        <div class="region-none" id="regionNone">No crop region configured — all default extraction zones are used.</div>
-      {% endif %}
-    </div>
+    {% if current_crop != "null" %}
+      <div class="region-badge">
+        &#10003;&ensp;Active &ensp;|&ensp;
+        x: <b id="rx1"></b>–<b id="rx2"></b> &ensp; y: <b id="ry1"></b>–<b id="ry2"></b>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-danger" id="disableBtn" style="font-size:13px;padding:7px 16px">Disable crop region</button>
+      </div>
+    {% else %}
+      <div class="region-none">No crop region configured yet. Set one up below.</div>
+    {% endif %}
   </div>
 
-  <!-- How to configure -->
+  <!-- Step 1: upload sample PDF -->
   <div class="card">
-    <h2>Set a New Crop Region</h2>
-    <ol class="steps">
-      <li>Upload any sample invoice PDF from your batch (only the first page is used).</li>
-      <li>Draw a rectangle around the area that contains the SI number.</li>
-      <li>Click <b>Save Region</b> — this region will be checked <b>first</b> on every page going forward.</li>
-    </ol>
+    <h2>Step 1 — Load a sample invoice page</h2>
+    <p>Upload any single invoice PDF from your batch. Only the first page is used for reference.</p>
 
-    <!-- Step 1: upload sample PDF -->
     <div class="drop-zone" id="dropZone">
       <input type="file" id="pdfInput" accept=".pdf">
       <svg width="36" height="36" fill="none" stroke="#0F4C81" stroke-width="1.5" viewBox="0 0 24 24" style="display:block;margin:0 auto 8px">
         <path d="M12 16V8m0 0-3 3m3-3 3 3M20 16.7A4 4 0 0 0 18 9h-1.26A7 7 0 1 0 5 15.7"/>
       </svg>
-      <div>Drag &amp; drop a sample PDF, or <label for="pdfInput">browse</label></div>
+      <div>Drag &amp; drop a PDF here, or <label for="pdfInput">browse</label></div>
       <div class="file-name" id="fileName">No file chosen</div>
     </div>
 
     <div class="btn-row">
-      <button class="btn btn-sm" id="loadBtn" disabled>Load sample page</button>
-      <span id="loadSpinner" style="display:none"><span class="spinner"></span> Rendering…</span>
+      <button class="btn btn-primary" id="loadBtn" disabled>
+        <span id="loadBtnLabel">Load page</span>
+        <span class="spinner" id="loadSpinner" style="display:none"></span>
+      </button>
     </div>
-
-    <div class="status-box" id="loadStatus"></div>
+    <div class="msg" id="loadMsg"></div>
   </div>
 
-  <!-- Step 2 + 3: cropper -->
-  <div class="card" id="cropperSection">
-    <h2>Draw the crop region</h2>
-    <p>Drag to move and resize the selection box until it tightly covers the SI number field.</p>
+  <!-- Step 2: draw selection + save -->
+  <div class="card" id="cropSection">
+    <h2>Step 2 — Select the SI number area</h2>
 
-    <div class="cropper-wrap">
-      <img id="cropImg" src="" alt="Invoice page preview" />
+    <ol class="steps">
+      <li><span class="step-num">1</span> <span><b>Click and drag</b> anywhere on the page to draw a new selection box.</span></li>
+      <li><span class="step-num">2</span> <span><b>Drag inside</b> the highlighted box to move it, or <b>drag the corner/edge handles</b> to resize.</span></li>
+      <li><span class="step-num">3</span> <span>Click <b>Save Region</b> when the box tightly covers the SI number field.</span></li>
+    </ol>
+
+    <!-- Canvas -->
+    <div class="canvas-wrap" id="canvasWrap">
+      <canvas id="cropCanvas"></canvas>
     </div>
-    <div class="crop-hint">Tip: zoom in or resize your browser window if the page is hard to see.</div>
+    <div class="canvas-hint">Tip: drag from outside the box to start a fresh selection at any time.</div>
+
+    <!-- Live region info -->
+    <div class="region-info" id="regionInfo">
+      <span id="noSelMsg">Draw a selection to begin.</span>
+      <span id="selStats" style="display:none">
+        <span class="lbl">x:</span><span class="val" id="infoX1"></span>–<span class="val" id="infoX2"></span>
+        &ensp;<span class="lbl">y:</span><span class="val" id="infoY1"></span>–<span class="val" id="infoY2"></span>
+        &ensp;<span class="lbl">w:</span><span class="val" id="infoW"></span>
+        &ensp;<span class="lbl">h:</span><span class="val" id="infoH"></span>
+      </span>
+    </div>
 
     <div class="btn-row">
-      <button class="btn btn-success" id="saveBtn">Save Region</button>
-      <button class="btn btn-sm" id="resetCropBtn" style="background:#6b7280">Reset selection</button>
+      <button class="btn btn-success" id="saveBtn" disabled>Save Region</button>
+      <button class="btn btn-ghost" id="resetBtn">Clear selection</button>
     </div>
-    <div class="status-box" id="saveStatus"></div>
+    <div class="msg" id="saveMsg"></div>
   </div>
 
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/cropperjs/dist/cropper.min.js"></script>
 <script>
-  // ── DOM refs ────────────────────────────────────────────────────────────────
-  const dropZone   = document.getElementById('dropZone');
-  const pdfInput   = document.getElementById('pdfInput');
-  const fileName   = document.getElementById('fileName');
-  const loadBtn    = document.getElementById('loadBtn');
-  const loadSpinner= document.getElementById('loadSpinner');
-  const loadStatus = document.getElementById('loadStatus');
-  const cropSection= document.getElementById('cropperSection');
-  const cropImg    = document.getElementById('cropImg');
-  const saveBtn    = document.getElementById('saveBtn');
-  const resetCropBtn = document.getElementById('resetCropBtn');
-  const saveStatus = document.getElementById('saveStatus');
-  const disableBtn = document.getElementById('disableBtn');
+// ═══════════════════════════════════════════════════════════════
+//  Canvas-based crop selector — zero external dependencies
+// ═══════════════════════════════════════════════════════════════
 
-  // ── State ───────────────────────────────────────────────────────────────────
-  let cropper = null;
-  let imgNaturalW = 0;
-  let imgNaturalH = 0;
+const HANDLE_HALF  = 7;   // half-size of handle squares (px)
+const MIN_SEL      = 12;  // minimum selection size to be valid (px)
+const OVERLAY_ALPHA = 0.55;
 
-  // ── Restore current region labels ───────────────────────────────────────────
-  const savedCrop = {{ current_crop|safe }};
-  if (savedCrop) {
-    const pct = v => (v * 100).toFixed(1) + '%';
-    document.getElementById('rx1').textContent = pct(savedCrop.x1);
-    document.getElementById('rx2').textContent = pct(savedCrop.x2);
-    document.getElementById('ry1').textContent = pct(savedCrop.y1);
-    document.getElementById('ry2').textContent = pct(savedCrop.y2);
+// ── DOM refs ──────────────────────────────────────────────────
+const dropZone  = document.getElementById('dropZone');
+const pdfInput  = document.getElementById('pdfInput');
+const fileName  = document.getElementById('fileName');
+const loadBtn   = document.getElementById('loadBtn');
+const loadBtnLbl= document.getElementById('loadBtnLabel');
+const loadSpinner=document.getElementById('loadSpinner');
+const loadMsg   = document.getElementById('loadMsg');
+const cropSection=document.getElementById('cropSection');
+const canvasWrap= document.getElementById('canvasWrap');
+const canvas    = document.getElementById('cropCanvas');
+const ctx       = canvas.getContext('2d');
+const saveBtn   = document.getElementById('saveBtn');
+const resetBtn  = document.getElementById('resetBtn');
+const saveMsg   = document.getElementById('saveMsg');
+const noSelMsg  = document.getElementById('noSelMsg');
+const selStats  = document.getElementById('selStats');
+const disableBtn= document.getElementById('disableBtn');
+
+// ── Crop state ────────────────────────────────────────────────
+let img = null;         // HTMLImageElement rendered from PDF
+let canvasW = 0;
+let canvasH = 0;
+
+// selection: top-left x,y + width,height in canvas pixels
+let sel = null;         // null = nothing selected
+
+// interaction state machine
+let mode = 'idle';      // 'idle' | 'drawing' | 'moving' | 'resizing'
+let dragStart = null;   // {x,y} in canvas coords
+let selSnapshot = null; // snapshot of sel at drag start
+let activeHandle = null;// handle id string during resize
+
+// ── Restore saved region labels ───────────────────────────────
+const savedCrop = {{ current_crop|safe }};
+if (savedCrop) {
+  const pct = v => (v * 100).toFixed(1) + '%';
+  document.getElementById('rx1').textContent = pct(savedCrop.x1);
+  document.getElementById('rx2').textContent = pct(savedCrop.x2);
+  document.getElementById('ry1').textContent = pct(savedCrop.y1);
+  document.getElementById('ry2').textContent = pct(savedCrop.y2);
+}
+
+// ── Helpers ───────────────────────────────────────────────────
+function showMsg(el, text, type) {
+  el.textContent = text;
+  el.className = 'msg ' + type;
+  el.style.display = 'block';
+}
+
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// Convert mouse/touch event to canvas pixel coords
+function eventPos(e) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvasW / rect.width;
+  const scaleY = canvasH / rect.height;
+  const src = e.touches ? e.touches[0] : e;
+  return {
+    x: clamp((src.clientX - rect.left) * scaleX, 0, canvasW),
+    y: clamp((src.clientY - rect.top)  * scaleY, 0, canvasH),
+  };
+}
+
+// Normalised sel always has positive w/h
+function normSel(s) {
+  if (!s) return null;
+  const x = Math.min(s.x, s.x + s.w);
+  const y = Math.min(s.y, s.y + s.h);
+  return { x, y, w: Math.abs(s.w), h: Math.abs(s.h) };
+}
+
+function selToFractions(s) {
+  const n = normSel(s);
+  return {
+    x1: n.x / canvasW,
+    y1: n.y / canvasH,
+    x2: (n.x + n.w) / canvasW,
+    y2: (n.y + n.h) / canvasH,
+  };
+}
+
+// ── Handle geometry ───────────────────────────────────────────
+function getHandles(s) {
+  const { x, y, w, h } = s;
+  return [
+    { id:'nw', cx:x,     cy:y,     cur:'nw-resize' },
+    { id:'n',  cx:x+w/2, cy:y,     cur:'n-resize'  },
+    { id:'ne', cx:x+w,   cy:y,     cur:'ne-resize'  },
+    { id:'e',  cx:x+w,   cy:y+h/2, cur:'e-resize'  },
+    { id:'se', cx:x+w,   cy:y+h,   cur:'se-resize'  },
+    { id:'s',  cx:x+w/2, cy:y+h,   cur:'s-resize'  },
+    { id:'sw', cx:x,     cy:y+h,   cur:'sw-resize'  },
+    { id:'w',  cx:x,     cy:y+h/2, cur:'w-resize'  },
+  ];
+}
+
+function hitHandle(pos, s) {
+  for (const h of getHandles(s)) {
+    if (Math.abs(pos.x - h.cx) <= HANDLE_HALF + 3 &&
+        Math.abs(pos.y - h.cy) <= HANDLE_HALF + 3) return h;
+  }
+  return null;
+}
+
+function insideSel(pos, s) {
+  return pos.x >= s.x && pos.x <= s.x + s.w &&
+         pos.y >= s.y && pos.y <= s.y + s.h;
+}
+
+// Apply resize delta based on handle id
+function applyResize(id, dx, dy, snap) {
+  let { x, y, w, h } = { ...snap };
+  if (id.includes('w')) { x = clamp(snap.x + dx, 0, snap.x + snap.w - 1); w = snap.x + snap.w - x; }
+  if (id.includes('e')) { w = clamp(snap.w + dx, 1, canvasW - snap.x); }
+  if (id.includes('n')) { y = clamp(snap.y + dy, 0, snap.y + snap.h - 1); h = snap.y + snap.h - y; }
+  if (id.includes('s')) { h = clamp(snap.h + dy, 1, canvasH - snap.y); }
+  return { x, y, w, h };
+}
+
+// ── Drawing ───────────────────────────────────────────────────
+function draw() {
+  if (!img) return;
+  ctx.clearRect(0, 0, canvasW, canvasH);
+
+  // 1. Full image (will be dimmed by overlay)
+  ctx.drawImage(img, 0, 0, canvasW, canvasH);
+
+  const n = normSel(sel);
+  if (!n || n.w < 2 || n.h < 2) {
+    // No selection — just draw dim overlay over entire page
+    ctx.fillStyle = `rgba(0,0,0,${OVERLAY_ALPHA})`;
+    ctx.fillRect(0, 0, canvasW, canvasH);
+    return;
   }
 
-  // ── Helpers ─────────────────────────────────────────────────────────────────
-  function showStatus(el, msg, type) {
-    el.textContent = msg;
-    el.className = 'status-box ' + type;
-    el.style.display = 'block';
+  // 2. Dim the whole canvas, then cut out the selection by redrawing the
+  //    image portion inside a clip path — giving a "spotlight" effect.
+  ctx.fillStyle = `rgba(0,0,0,${OVERLAY_ALPHA})`;
+  ctx.fillRect(0, 0, canvasW, canvasH);
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(n.x, n.y, n.w, n.h);
+  ctx.clip();
+  ctx.drawImage(img, 0, 0, canvasW, canvasH);
+  ctx.restore();
+
+  // 3. Selection border
+  ctx.strokeStyle = '#0F4C81';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(n.x + 1, n.y + 1, n.w - 2, n.h - 2);
+
+  // 4. Inner guide lines (rule of thirds — subtle)
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  for (let i = 1; i < 3; i++) {
+    const gx = n.x + (n.w * i / 3);
+    const gy = n.y + (n.h * i / 3);
+    ctx.beginPath(); ctx.moveTo(gx, n.y); ctx.lineTo(gx, n.y + n.h); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(n.x, gy); ctx.lineTo(n.x + n.w, gy); ctx.stroke();
   }
+  ctx.setLineDash([]);
 
-  // ── File pick / drag-drop ───────────────────────────────────────────────────
-  pdfInput.addEventListener('change', () => {
-    if (pdfInput.files[0]) {
-      fileName.textContent = pdfInput.files[0].name;
-      loadBtn.disabled = false;
-      loadStatus.style.display = 'none';
-    }
-  });
+  // 5. Corner and edge handles
+  for (const h of getHandles(n)) {
+    ctx.fillStyle   = '#ffffff';
+    ctx.strokeStyle = '#0F4C81';
+    ctx.lineWidth   = 2;
+    ctx.fillRect(h.cx - HANDLE_HALF, h.cy - HANDLE_HALF, HANDLE_HALF * 2, HANDLE_HALF * 2);
+    ctx.strokeRect(h.cx - HANDLE_HALF, h.cy - HANDLE_HALF, HANDLE_HALF * 2, HANDLE_HALF * 2);
+  }
+}
 
-  dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
-  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
-  dropZone.addEventListener('drop', e => {
-    e.preventDefault();
-    dropZone.classList.remove('dragover');
-    const f = e.dataTransfer.files[0];
-    if (f && f.name.toLowerCase().endsWith('.pdf')) {
-      const dt = new DataTransfer();
-      dt.items.add(f);
-      pdfInput.files = dt.files;
-      fileName.textContent = f.name;
-      loadBtn.disabled = false;
-      loadStatus.style.display = 'none';
-    } else {
-      showStatus(loadStatus, 'Please drop a PDF file.', 'err');
-    }
-  });
+function updateInfo() {
+  const n = normSel(sel);
+  if (!n || n.w < MIN_SEL || n.h < MIN_SEL) {
+    noSelMsg.style.display = '';
+    selStats.style.display = 'none';
+    saveBtn.disabled = true;
+    return;
+  }
+  const pct = v => (v * 100).toFixed(1) + '%';
+  const f = selToFractions(n);
+  document.getElementById('infoX1').textContent = pct(f.x1);
+  document.getElementById('infoX2').textContent = pct(f.x2);
+  document.getElementById('infoY1').textContent = pct(f.y1);
+  document.getElementById('infoY2').textContent = pct(f.y2);
+  document.getElementById('infoW').textContent  = pct(f.x2 - f.x1);
+  document.getElementById('infoH').textContent  = pct(f.y2 - f.y1);
+  noSelMsg.style.display = 'none';
+  selStats.style.display = '';
+  saveBtn.disabled = false;
+}
 
-  // ── Load sample page ─────────────────────────────────────────────────────────
-  loadBtn.addEventListener('click', async () => {
-    const file = pdfInput.files[0];
-    if (!file) return;
+// ── Canvas sizing ─────────────────────────────────────────────
+function sizeCanvas() {
+  if (!img) return;
+  const containerW = canvasWrap.clientWidth;
+  canvasW = containerW;
+  canvasH = Math.round(containerW * img.naturalHeight / img.naturalWidth);
+  canvas.width  = canvasW;
+  canvas.height = canvasH;
+  canvas.style.height = canvasH + 'px';
+}
 
-    loadBtn.disabled = true;
-    loadSpinner.style.display = 'inline';
-    loadStatus.style.display = 'none';
+// ── Mouse / touch events ──────────────────────────────────────
+function onPointerDown(e) {
+  e.preventDefault();
+  const pos = eventPos(e);
+  const n = normSel(sel);
 
-    try {
-      const fd = new FormData();
-      fd.append('file', file);
-      const resp = await fetch('/render-sample-page', { method: 'POST', body: fd });
-      const data = await resp.json();
-
-      if (data.error) {
-        showStatus(loadStatus, '✗ ' + data.error, 'err');
-        return;
-      }
-
-      // Store natural dimensions for fraction calculation
-      imgNaturalW = data.img_width;
-      imgNaturalH = data.img_height;
-
-      // Destroy previous cropper if any
-      if (cropper) { cropper.destroy(); cropper = null; }
-
-      // Set image source
-      cropImg.src = data.image;
-      cropSection.style.display = 'block';
-      cropSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
-
-      // Init Cropper.js after image loads
-      cropImg.onload = () => {
-        cropper = new Cropper(cropImg, {
-          viewMode: 1,       // restrict crop box to canvas
-          dragMode: 'move',  // pan by default; draw on create
-          autoCropArea: 0.25, // start with a small selection
-          movable: true,
-          rotatable: false,
-          scalable: false,
-          zoomable: false,
-          guides: true,
-          center: true,
-          highlight: true,
-          cropBoxMovable: true,
-          cropBoxResizable: true,
-        });
-      };
-
-      showStatus(loadStatus, '✓ Page loaded — draw your selection below.', 'ok');
-
-    } catch (err) {
-      showStatus(loadStatus, '✗ ' + err.message, 'err');
-    } finally {
-      loadBtn.disabled = false;
-      loadSpinner.style.display = 'none';
-    }
-  });
-
-  // ── Reset crop box ──────────────────────────────────────────────────────────
-  resetCropBtn.addEventListener('click', () => {
-    if (cropper) cropper.reset();
-  });
-
-  // ── Save region ──────────────────────────────────────────────────────────────
-  saveBtn.addEventListener('click', async () => {
-    if (!cropper) return;
-
-    const box = cropper.getCropBoxData();   // pixels relative to canvas
-    const canvasData = cropper.getCanvasData(); // canvas position/size in container
-
-    // Convert crop box (canvas-relative) to fractions of the rendered image
-    const x1 = (box.left - canvasData.left) / canvasData.width;
-    const y1 = (box.top  - canvasData.top)  / canvasData.height;
-    const x2 = x1 + box.width  / canvasData.width;
-    const y2 = y1 + box.height / canvasData.height;
-
-    // Clamp
-    const clamp = v => Math.max(0, Math.min(1, v));
-    const region = {
-      x1: clamp(x1), y1: clamp(y1),
-      x2: clamp(x2), y2: clamp(y2),
-    };
-
-    if (region.x2 - region.x1 < 0.01 || region.y2 - region.y1 < 0.01) {
-      showStatus(saveStatus, '✗ Selection is too small. Please draw a larger area.', 'err');
+  if (n && n.w > MIN_SEL && n.h > MIN_SEL) {
+    const handle = hitHandle(pos, n);
+    if (handle) {
+      mode = 'resizing';
+      activeHandle = handle.id;
+      dragStart = pos;
+      selSnapshot = { ...n };
       return;
     }
+    if (insideSel(pos, n)) {
+      mode = 'moving';
+      dragStart = pos;
+      selSnapshot = { ...n };
+      return;
+    }
+  }
 
-    saveBtn.disabled = true;
-    saveStatus.style.display = 'none';
+  // Start a new selection
+  mode = 'drawing';
+  dragStart = pos;
+  sel = { x: pos.x, y: pos.y, w: 0, h: 0 };
+  draw();
+  updateInfo();
+}
 
-    try {
-      const resp = await fetch('/save-crop-region', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(region),
-      });
-      const data = await resp.json();
+function onPointerMove(e) {
+  e.preventDefault();
+  const pos = eventPos(e);
 
-      if (data.error) {
-        showStatus(saveStatus, '✗ ' + data.error, 'err');
-      } else {
-        const r = data.region;
-        const pct = v => (v * 100).toFixed(1) + '%';
-        showStatus(saveStatus,
-          `✓ Crop region saved! x: ${pct(r.x1)}–${pct(r.x2)}, y: ${pct(r.y1)}–${pct(r.y2)}. ` +
-          `This region will be checked first on every invoice page.`,
-          'ok'
-        );
-        // Reload to update "Current Region" panel
-        setTimeout(() => window.location.reload(), 1500);
+  if (mode === 'idle') {
+    // Update cursor
+    const n = normSel(sel);
+    if (n && n.w > MIN_SEL && n.h > MIN_SEL) {
+      const handle = hitHandle(pos, n);
+      if (handle)          canvas.style.cursor = handle.cur;
+      else if (insideSel(pos, n)) canvas.style.cursor = 'move';
+      else                 canvas.style.cursor = 'crosshair';
+    } else {
+      canvas.style.cursor = 'crosshair';
+    }
+    return;
+  }
+
+  const dx = pos.x - dragStart.x;
+  const dy = pos.y - dragStart.y;
+
+  if (mode === 'drawing') {
+    sel = {
+      x: Math.min(dragStart.x, pos.x),
+      y: Math.min(dragStart.y, pos.y),
+      w: Math.abs(dx),
+      h: Math.abs(dy),
+    };
+
+  } else if (mode === 'moving') {
+    sel = {
+      x: clamp(selSnapshot.x + dx, 0, canvasW - selSnapshot.w),
+      y: clamp(selSnapshot.y + dy, 0, canvasH - selSnapshot.h),
+      w: selSnapshot.w,
+      h: selSnapshot.h,
+    };
+
+  } else if (mode === 'resizing') {
+    sel = applyResize(activeHandle, dx, dy, selSnapshot);
+  }
+
+  draw();
+  updateInfo();
+}
+
+function onPointerUp(e) {
+  if (mode !== 'idle') {
+    // Normalise sel so x,y are always top-left
+    if (sel) sel = normSel(sel);
+    mode = 'idle';
+    activeHandle = null;
+    draw();
+    updateInfo();
+  }
+}
+
+canvas.addEventListener('mousedown',  onPointerDown);
+canvas.addEventListener('mousemove',  onPointerMove);
+canvas.addEventListener('mouseup',    onPointerUp);
+canvas.addEventListener('mouseleave', onPointerUp);
+canvas.addEventListener('touchstart', onPointerDown, { passive:false });
+canvas.addEventListener('touchmove',  onPointerMove, { passive:false });
+canvas.addEventListener('touchend',   onPointerUp);
+
+window.addEventListener('resize', () => { sizeCanvas(); draw(); });
+
+// Keyboard shortcuts
+window.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    sel = null; mode = 'idle'; draw(); updateInfo();
+  }
+  if ((e.key === 'Enter' || e.key === 's') && !saveBtn.disabled) {
+    saveBtn.click();
+  }
+});
+
+// ── File pick / drag-drop ─────────────────────────────────────
+pdfInput.addEventListener('change', () => {
+  if (pdfInput.files[0]) {
+    fileName.textContent = pdfInput.files[0].name;
+    loadBtn.disabled = false;
+    loadMsg.style.display = 'none';
+  }
+});
+
+dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('dragover');
+  const f = e.dataTransfer.files[0];
+  if (f && f.name.toLowerCase().endsWith('.pdf')) {
+    const dt = new DataTransfer();
+    dt.items.add(f);
+    pdfInput.files = dt.files;
+    fileName.textContent = f.name;
+    loadBtn.disabled = false;
+    loadMsg.style.display = 'none';
+  } else {
+    showMsg(loadMsg, 'Please drop a PDF file.', 'err');
+  }
+});
+
+// ── Load sample page ──────────────────────────────────────────
+loadBtn.addEventListener('click', async () => {
+  const file = pdfInput.files[0];
+  if (!file) return;
+
+  loadBtn.disabled = true;
+  loadBtnLbl.textContent = 'Rendering…';
+  loadSpinner.style.display = 'inline-block';
+  loadMsg.style.display = 'none';
+
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    const resp = await fetch('/render-sample-page', { method: 'POST', body: fd });
+    const data = await resp.json();
+
+    if (data.error) { showMsg(loadMsg, '✗ ' + data.error, 'err'); return; }
+
+    // Load into an <img> for canvas drawing
+    img = new Image();
+    img.onload = () => {
+      sizeCanvas();
+
+      // Pre-select top-right 40% × 20% as a suggested starting region
+      // (common location for SI numbers on invoices)
+      sel = {
+        x: Math.round(canvasW * 0.55),
+        y: Math.round(canvasH * 0.02),
+        w: Math.round(canvasW * 0.42),
+        h: Math.round(canvasH * 0.18),
+      };
+
+      // If user has an existing crop region, restore it as the initial selection
+      if (savedCrop) {
+        sel = {
+          x: Math.round(savedCrop.x1 * canvasW),
+          y: Math.round(savedCrop.y1 * canvasH),
+          w: Math.round((savedCrop.x2 - savedCrop.x1) * canvasW),
+          h: Math.round((savedCrop.y2 - savedCrop.y1) * canvasH),
+        };
       }
-    } catch (err) {
-      showStatus(saveStatus, '✗ ' + err.message, 'err');
-    } finally {
+
+      draw();
+      updateInfo();
+      cropSection.style.display = 'block';
+      cropSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    };
+    img.src = data.image;
+
+    showMsg(loadMsg, '✓ Page loaded — adjust the selection below, then click Save Region.', 'ok');
+
+  } catch (err) {
+    showMsg(loadMsg, '✗ ' + err.message, 'err');
+  } finally {
+    loadBtn.disabled = false;
+    loadBtnLbl.textContent = 'Load page';
+    loadSpinner.style.display = 'none';
+  }
+});
+
+// ── Reset selection ───────────────────────────────────────────
+resetBtn.addEventListener('click', () => {
+  sel = null; mode = 'idle'; draw(); updateInfo();
+});
+
+// ── Save region ───────────────────────────────────────────────
+saveBtn.addEventListener('click', async () => {
+  const n = normSel(sel);
+  if (!n || n.w < MIN_SEL || n.h < MIN_SEL) return;
+
+  const region = selToFractions(n);
+  saveBtn.disabled = true;
+  saveMsg.style.display = 'none';
+
+  try {
+    const resp = await fetch('/save-crop-region', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(region),
+    });
+    const data = await resp.json();
+
+    if (data.error) {
+      showMsg(saveMsg, '✗ ' + data.error, 'err');
       saveBtn.disabled = false;
+    } else {
+      const r = data.region;
+      const pct = v => (v * 100).toFixed(1) + '%';
+      showMsg(saveMsg,
+        `✓ Region saved: x ${pct(r.x1)}–${pct(r.x2)}, y ${pct(r.y1)}–${pct(r.y2)}. ` +
+        `Redirecting back…`, 'ok');
+      setTimeout(() => window.location.href = '/', 1400);
+    }
+  } catch (err) {
+    showMsg(saveMsg, '✗ ' + err.message, 'err');
+    saveBtn.disabled = false;
+  }
+});
+
+// ── Disable region ────────────────────────────────────────────
+if (disableBtn) {
+  disableBtn.addEventListener('click', async () => {
+    disableBtn.disabled = true;
+    try {
+      await fetch('/disable-crop-region', { method: 'POST' });
+      window.location.reload();
+    } catch (_) {
+      disableBtn.disabled = false;
     }
   });
-
-  // ── Disable region ──────────────────────────────────────────────────────────
-  if (disableBtn) {
-    disableBtn.addEventListener('click', async () => {
-      disableBtn.disabled = true;
-      try {
-        await fetch('/disable-crop-region', { method: 'POST' });
-        window.location.reload();
-      } catch (_) {
-        disableBtn.disabled = false;
-      }
-    });
-  }
+}
 </script>
 </body>
 </html>
