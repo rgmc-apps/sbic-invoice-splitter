@@ -325,18 +325,24 @@ def _extract_si(doc: fitz.Document, idx: int) -> tuple[str, str]:
 
 def _infer_from_sequence(raw: list[tuple[str, str]]) -> list[tuple[str, str]]:
     """
-    Detect a consecutive numeric pattern across successfully-extracted pages and
-    fill in any 'fallback' pages by inferring the expected SI number.
+    Detect a consecutive numeric pattern across successfully-extracted pages,
+    fill in 'fallback' pages, and correct OCR digit misreads on extracted pages.
 
     Algorithm:
       1. Collect all pages whose SI is a pure integer string and method != 'fallback'.
       2. For every consecutive pair of known pages compute (value_diff / page_gap).
       3. Take the median step — robust against a few OCR mis-reads.
-      4. If the step is a clean integer (±0.15 tolerance), anchor on the median
-         known page and project forward/backward to fill fallback pages.
-      5. Zero-padding width is matched to the widest known SI string.
+      4. For each known page compute its "virtual page-0" value (v − step × idx).
+         Take the mode across all known pages — this is the true sequence base
+         even when some pages have digit-confusion OCR errors (e.g. "5"→"8"),
+         because those erroneous pages project to a different v0 than the majority.
+      5. Fill 'fallback' pages by projecting from the anchor  → method "sequence".
+      6. Validate every OCR-extracted value against the sequence prediction.
+         If the value has the same digit count and differs in ≤ 2 positions
+         (digit-level Hamming distance), it is a digit-confusion OCR error —
+         replace with the predicted value  → method "corrected".
 
-    Returns the same-length list with inferred values substituted where applicable.
+    Returns the same-length list with inferred/corrected values where applicable.
     """
     # ── collect known numeric pages ────────────────────────────────────────────
     known: dict[int, int] = {}   # page_idx → integer SI value
@@ -369,12 +375,18 @@ def _infer_from_sequence(raw: list[tuple[str, str]]) -> list[tuple[str, str]]:
     if step == 0:
         return raw  # all same value — nothing useful to infer
 
-    # ── anchor on the median known page (minimises propagation error) ─────────
-    mid = len(sorted_known) // 2
-    anchor_idx, anchor_val = sorted_known[mid]
+    # ── anchor via mode of virtual-page-0 values ──────────────────────────────
+    # Each correctly-read page gives: v0 = value − step × page_idx.
+    # Pages with OCR digit errors produce a different v0 (minority).
+    # The most common v0 is the true base of the sequence.
+    v0_counts: dict[int, int] = {}
+    for idx, val in known.items():
+        v0 = val - step * idx
+        v0_counts[v0] = v0_counts.get(v0, 0) + 1
+    best_v0 = max(v0_counts, key=lambda k: v0_counts[k])
 
     def _project(page_idx: int) -> str:
-        val = anchor_val + (page_idx - anchor_idx) * step
+        val = best_v0 + step * page_idx
         if val < 0:
             return str(val)
         return str(val).zfill(pad_width)
@@ -383,8 +395,21 @@ def _infer_from_sequence(raw: list[tuple[str, str]]) -> list[tuple[str, str]]:
     result = list(raw)
     for i, (si, method) in enumerate(raw):
         if method == "fallback":
-            inferred = _sanitize(_project(i))
-            result[i] = (inferred, "sequence")
+            result[i] = (_sanitize(_project(i)), "sequence")
+
+    # ── correct OCR digit misreads against the sequence ───────────────────────
+    # If an extracted value has the same digit count as the prediction and
+    # differs in at most 2 digit positions, treat it as a digit-confusion error
+    # (e.g. "5" misread as "8") and replace with the predicted value.
+    for i, (si, method) in enumerate(result):
+        if method in ("sequence", "corrected"):
+            continue  # already filled or corrected
+        predicted = _project(i)
+        if len(si) != len(predicted):
+            continue  # different digit count — leave untouched
+        mismatches = sum(a != b for a, b in zip(si, predicted))
+        if 0 < mismatches <= 2:
+            result[i] = (predicted, "corrected")
 
     return result
 
@@ -526,15 +551,49 @@ def _save_result(results: list[dict], zip_bytes: bytes,
     stem = re.sub(r'[\\/*?:"<>|\r\n\t]', '_', Path(original_filename).stem).strip().strip('._') or "invoices"
     download_name = f"{stem}_invoices.zip"
 
-    # Keep a local JSON sidecar for the result page (tiny, fast).
-    (TMP_DIR / f"{token}.json").write_text(json.dumps({
+    meta = {
         "results": results,
         "original_size": original_size,
         "optimized_size": optimized_size,
         "zip_blob": zip_blob_name,
         "download_name": download_name,
-    }))
+    }
+    meta_json = json.dumps(meta)
+
+    # Upload JSON sidecar to GCS so every Cloud Run instance can read it —
+    # local /tmp is ephemeral and not shared across instances.
+    _storage().bucket(UPLOAD_BUCKET).blob(f"results/{token}.json").upload_from_string(
+        meta_json, content_type="application/json"
+    )
+    # Also cache locally so the redirected /result request on the *same* instance
+    # skips the GCS round-trip.
+    (TMP_DIR / f"{token}.json").write_text(meta_json)
     return token
+
+
+def _load_result_meta(token: str) -> dict | None:
+    """Return result metadata for *token*, or None if not found.
+
+    Tries the local /tmp cache first (zero-latency on the same instance),
+    then falls back to GCS so cross-instance redirects always work.
+    If the GCS copy is found it is written to the local cache so subsequent
+    calls on this instance skip the network round-trip.
+    """
+    local = TMP_DIR / f"{token}.json"
+    if local.exists():
+        try:
+            return json.loads(local.read_text())
+        except Exception:
+            pass  # corrupt local file — fall through to GCS
+
+    try:
+        data = _storage().bucket(UPLOAD_BUCKET).blob(
+            f"results/{token}.json"
+        ).download_as_text()
+        local.write_text(data)   # populate local cache for this instance
+        return json.loads(data)
+    except Exception:
+        return None
 
 
 # ── Flask app ──────────────────────────────────────────────────────────────────
@@ -680,10 +739,9 @@ def optimize_only():
 def result(token: str):
     if not re.fullmatch(r'[A-Za-z0-9_\-]{24,40}', token):
         abort(404)
-    meta_path = TMP_DIR / f"{token}.json"
-    if not meta_path.exists():
+    meta = _load_result_meta(token)
+    if meta is None:
         abort(404)
-    meta = json.loads(meta_path.read_text())
     return render_template("result.html", results=meta["results"],
                            original_size=meta["original_size"],
                            optimized_size=meta["optimized_size"], token=token)
@@ -695,10 +753,9 @@ def download(token: str):
         abort(404)
 
     # Resolve the GCS blob name from the JSON sidecar.
-    meta_path = TMP_DIR / f"{token}.json"
-    if not meta_path.exists():
+    meta = _load_result_meta(token)
+    if meta is None:
         abort(404)
-    meta = json.loads(meta_path.read_text())
     zip_blob_name = meta.get("zip_blob")
     if not zip_blob_name:
         abort(404)

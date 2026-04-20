@@ -27,6 +27,7 @@
     .pill-ocr   {background:#e3f6f0;color:#0a5c40}
     .pill-bar   {background:#fff3cd;color:#856404}
     .pill-seq   {background:#e8f0fe;color:#1a3a8f}
+    .pill-corr  {background:#fff3e0;color:#7c4a00}
     .pill-fall  {background:#fde8e8;color:#7c1e1e}
     .note{color:var(--muted);font-size:13px;margin-top:4px}
     .stat{display:flex;gap:24px;flex-wrap:wrap;margin-bottom:20px}
@@ -47,6 +48,7 @@
   {% set text_count  = results | selectattr('method', 'in', ['text-crop','text-bottom','text-right','text-full']) | list | length %}
   {% set ocr_count   = results | selectattr('method', 'in', ['ocr-crop','ocr-bottom','ocr-right','ocr-full']) | list | length %}
   {% set seq_count   = results | selectattr('method', 'equalto', 'sequence') | list | length %}
+  {% set corr_count  = results | selectattr('method', 'equalto', 'corrected') | list | length %}
   {% set fall_count  = results | selectattr('method', 'equalto', 'fallback') | list | length %}
   {% set saved_pct   = ((original_size - optimized_size) / original_size * 100) | round(1) %}
   {% set orig_mb     = (original_size   / 1048576) | round(2) %}
@@ -56,6 +58,7 @@
     {% if text_count %}<div class="stat-item"><div class="stat-num" style="color:var(--green)">{{ text_count }}</div><div class="stat-lbl">Via text</div></div>{% endif %}
     {% if ocr_count %}<div class="stat-item"><div class="stat-num" style="color:#0a5c40">{{ ocr_count }}</div><div class="stat-lbl">Via OCR</div></div>{% endif %}
     {% if seq_count %}<div class="stat-item"><div class="stat-num" style="color:#1a3a8f">{{ seq_count }}</div><div class="stat-lbl">Via sequence</div></div>{% endif %}
+    {% if corr_count %}<div class="stat-item"><div class="stat-num" style="color:#7c4a00">{{ corr_count }}</div><div class="stat-lbl">OCR corrected</div></div>{% endif %}
     {% if fall_count %}<div class="stat-item"><div class="stat-num" style="color:#b00020">{{ fall_count }}</div><div class="stat-lbl">Unidentified</div></div>{% endif %}
   </div>
 
@@ -104,6 +107,8 @@
               <span class="pill pill-ocr">{{ r.method }}</span>
             {% elif r.method == 'sequence' %}
               <span class="pill pill-seq">sequence</span>
+            {% elif r.method == 'corrected' %}
+              <span class="pill pill-corr">corrected</span>
             {% elif r.method == 'fallback' %}
               <span class="pill pill-fall">fallback</span>
             {% else %}
