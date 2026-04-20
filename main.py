@@ -50,7 +50,8 @@ RESULT_TTL = 3600  # seconds — local temp files expire after 1 hour
 
 # ── Crop-region config ─────────────────────────────────────────────────────────
 # Persisted alongside main.py so it survives container restarts.
-CROP_CONFIG_PATH = Path(__file__).parent / "crop_config.json"
+CROP_CONFIG_PATH  = Path(__file__).parent / "crop_config.json"
+CODES_CONFIG_PATH = Path(__file__).parent / "customer_codes.json"
 
 _crop_region_cache: dict | None = None
 _crop_region_mtime: float = 0.0
@@ -78,21 +79,47 @@ def _load_crop_region() -> dict | None:
         return None
 
 # ── Customer-code mapping ──────────────────────────────────────────────────────
-# Maps a keyword found in the uploaded filename (case-insensitive) to the
-# customer's SI code used in the output filename prefix.
-# To add a new customer: insert a new entry below — no other code changes needed.
-_CUSTOMER_CODES: dict[str, str] = {
+# Premade defaults — shown on a fresh install before the user adds any codes.
+# These are seeded into customer_codes.json the first time any edit is saved.
+_PREMADE_CODES: dict[str, str] = {
     "MTC":  "240762",
     "SBIC": "190275",
 }
+
+_codes_cache: dict[str, str] | None = None
+_codes_mtime: float = 0.0
+
+
+def _load_customer_codes() -> dict[str, str]:
+    """Return keyword→code mapping.  Reads customer_codes.json; falls back to
+    premade defaults when the file does not yet exist."""
+    global _codes_cache, _codes_mtime
+    try:
+        if CODES_CONFIG_PATH.exists():
+            mtime = CODES_CONFIG_PATH.stat().st_mtime
+            if mtime != _codes_mtime or _codes_cache is None:
+                _codes_cache = json.loads(CODES_CONFIG_PATH.read_text())
+                _codes_mtime = mtime
+            return _codes_cache
+    except Exception:
+        pass
+    return dict(_PREMADE_CODES)  # file absent or unreadable — use defaults
+
+
+def _save_customer_codes(codes: dict[str, str]) -> None:
+    """Persist codes to disk and invalidate the in-memory cache."""
+    global _codes_cache, _codes_mtime
+    CODES_CONFIG_PATH.write_text(json.dumps(codes, indent=2))
+    _codes_cache = None  # force reload on next access
 
 
 def _resolve_customer_code(filename: str) -> str:
     """Return the SI customer code whose key appears in *filename* (stem only).
     Falls back to 'UNKNOWN' if no mapping key is found."""
+    codes = _load_customer_codes()
     stem = Path(filename).stem.upper()
-    for key, code in _CUSTOMER_CODES.items():
-        if key in stem:
+    for key, code in codes.items():
+        if key.upper() in stem:
             return code
     return "UNKNOWN"
 
@@ -741,6 +768,49 @@ def get_crop_region():
     """Return current crop region config (or empty object if none)."""
     crop = _load_crop_region()
     return jsonify(crop or {})
+
+
+# ── Customer-code configuration ───────────────────────────────────────────────
+
+@app.get("/customer-codes")
+def customer_codes_page():
+    codes = _load_customer_codes()
+    return render_template("customer_codes.html",
+                           codes=codes,
+                           premade=_PREMADE_CODES)
+
+
+@app.post("/customer-codes/upsert")
+def customer_codes_upsert():
+    """Add or update a keyword→code mapping."""
+    data = request.get_json(silent=True) or {}
+    keyword = str(data.get("keyword", "")).strip().upper()
+    code    = str(data.get("code", "")).strip()
+    if not keyword or not code:
+        return jsonify({"error": "keyword and code are required"}), 400
+    if not re.fullmatch(r'[A-Z0-9 _\-]{1,40}', keyword):
+        return jsonify({"error": "keyword must be 1–40 alphanumeric characters"}), 400
+    if not re.fullmatch(r'[A-Za-z0-9\-]{1,40}', code):
+        return jsonify({"error": "code must be 1–40 alphanumeric characters"}), 400
+    codes = _load_customer_codes()
+    codes[keyword] = code
+    _save_customer_codes(codes)
+    return jsonify({"ok": True, "keyword": keyword, "code": code})
+
+
+@app.post("/customer-codes/delete")
+def customer_codes_delete():
+    """Remove a keyword→code mapping."""
+    data = request.get_json(silent=True) or {}
+    keyword = str(data.get("keyword", "")).strip().upper()
+    if not keyword:
+        return jsonify({"error": "keyword is required"}), 400
+    codes = _load_customer_codes()
+    if keyword not in codes:
+        return jsonify({"error": "keyword not found"}), 404
+    del codes[keyword]
+    _save_customer_codes(codes)
+    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
