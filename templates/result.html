@@ -24,6 +24,7 @@
     code{background:#f0f4f9;padding:2px 6px;border-radius:4px;font-size:13px}
     .pill{display:inline-block;font-size:11px;padding:2px 8px;border-radius:999px;font-weight:500}
     .pill-text  {background:#e8f4e8;color:#155724}
+    .pill-ocr   {background:#e3f6f0;color:#0a5c40}
     .pill-bar   {background:#fff3cd;color:#856404}
     .pill-seq   {background:#e8f0fe;color:#1a3a8f}
     .pill-fall  {background:#fde8e8;color:#7c1e1e}
@@ -43,8 +44,8 @@
   <div class="sub">{{ results|length }} page{{ 's' if results|length != 1 else '' }} processed successfully.</div>
 
   <!-- Stats -->
-  {% set text_count  = results | selectattr('method', 'in', ['text-bottom','text-right','text-full']) | list | length %}
-  {% set bar_count   = results | selectattr('method', 'equalto', 'barcode') | list | length %}
+  {% set text_count  = results | selectattr('method', 'in', ['text-crop','text-bottom','text-right','text-full']) | list | length %}
+  {% set ocr_count   = results | selectattr('method', 'in', ['ocr-crop','ocr-bottom','ocr-right','ocr-full']) | list | length %}
   {% set seq_count   = results | selectattr('method', 'equalto', 'sequence') | list | length %}
   {% set fall_count  = results | selectattr('method', 'equalto', 'fallback') | list | length %}
   {% set saved_pct   = ((original_size - optimized_size) / original_size * 100) | round(1) %}
@@ -52,8 +53,8 @@
   {% set opt_mb      = (optimized_size  / 1048576) | round(2) %}
   <div class="stat">
     <div class="stat-item"><div class="stat-num">{{ results|length }}</div><div class="stat-lbl">Total pages</div></div>
-    <div class="stat-item"><div class="stat-num" style="color:var(--green)">{{ text_count }}</div><div class="stat-lbl">Via text</div></div>
-    <div class="stat-item"><div class="stat-num" style="color:#856404">{{ bar_count }}</div><div class="stat-lbl">Via barcode</div></div>
+    {% if text_count %}<div class="stat-item"><div class="stat-num" style="color:var(--green)">{{ text_count }}</div><div class="stat-lbl">Via text</div></div>{% endif %}
+    {% if ocr_count %}<div class="stat-item"><div class="stat-num" style="color:#0a5c40">{{ ocr_count }}</div><div class="stat-lbl">Via OCR</div></div>{% endif %}
     {% if seq_count %}<div class="stat-item"><div class="stat-num" style="color:#1a3a8f">{{ seq_count }}</div><div class="stat-lbl">Via sequence</div></div>{% endif %}
     {% if fall_count %}<div class="stat-item"><div class="stat-num" style="color:#b00020">{{ fall_count }}</div><div class="stat-lbl">Unidentified</div></div>{% endif %}
   </div>
@@ -97,14 +98,16 @@
           <td>{{ r.page }}</td>
           <td><code>{{ r.filename }}</code></td>
           <td>
-            {% if r.method in ['text-bottom','text-right','text-full'] %}
+            {% if r.method in ['text-crop','text-bottom','text-right','text-full'] %}
               <span class="pill pill-text">{{ r.method }}</span>
-            {% elif r.method == 'barcode' %}
-              <span class="pill pill-bar">barcode</span>
+            {% elif r.method in ['ocr-crop','ocr-bottom','ocr-right','ocr-full'] %}
+              <span class="pill pill-ocr">{{ r.method }}</span>
             {% elif r.method == 'sequence' %}
               <span class="pill pill-seq">sequence</span>
-            {% else %}
+            {% elif r.method == 'fallback' %}
               <span class="pill pill-fall">fallback</span>
+            {% else %}
+              <span class="pill pill-fall">{{ r.method }}</span>
             {% endif %}
           </td>
         </tr>

@@ -30,6 +30,18 @@ except Exception:
     _pymupdf4llm = None  # type: ignore[assignment]
     _ML4LLM_OK = False
 
+# pytesseract wraps the Tesseract OCR engine.  OCR reads from rendered pixels,
+# completely bypassing the font-encoding layer — the only reliable approach
+# when invoice PDFs use custom glyph-to-Unicode mappings that cause get_text()
+# to return garbled characters (e.g. "U:rrr&?8s" instead of "Nº 51285").
+# Requires the tesseract-ocr system package (installed in Dockerfile).
+try:
+    import pytesseract as _pytesseract
+    _TESS_OK = True
+except Exception:
+    _pytesseract = None  # type: ignore[assignment]
+    _TESS_OK = False
+
 UPLOAD_BUCKET     = os.environ.get("UPLOAD_BUCKET", "sbic-splitter-uploads")
 OPTIMIZE_LIMIT_MB = int(os.environ.get("OPTIMIZE_LIMIT_MB", 2048))  # Flask hard cap for /optimize-only
 TMP_DIR           = Path(tempfile.gettempdir()) / "inv_sep"
@@ -88,6 +100,13 @@ def _resolve_customer_code(filename: str) -> str:
 # ── SI-number extraction patterns ─────────────────────────────────────────────
 # Tried in order — first match wins.
 _SI_RE = [
+    # 0a. "SI #: 051285" — the label printed on MNLtaste / MTC invoices.
+    #     The hash-colon variant is what Tesseract reads from these PDFs.
+    re.compile(r'\bSI\s*#\s*:?\s*([0-9]{4,})', re.I),
+    # 0b. "Nº 51285" / "No 51285" — the large bold display number on these invoices.
+    #     Tesseract renders the numero sign (Nº) as "No"; we also accept "N°".
+    #     Constrained to 5–6 digits so it doesn't accidentally match 10-digit PO numbers.
+    re.compile(r'\bN[º°o]\s*\.?\s*([0-9]{5,6})\b'),
     # 1. Explicit "SI No:" / "S.I. No:" / "S.I. NO:" label (with optional dot/space variants)
     re.compile(r'\bS\.?\s*I\.?\s*[Nn][Oo]\.?\s*:?\s*([A-Z0-9]{4,}(?:[-/]\d+)*)', re.I),
     # 2. Bare "NO:" at the start of a line or after whitespace — common shorthand on
@@ -177,14 +196,40 @@ def _page_text(doc: fitz.Document, idx: int, clip: fitz.Rect | None = None) -> s
     return page.get_text("text")
 
 
+def _ocr_text(page: fitz.Page, clip: fitz.Rect | None = None) -> str:
+    """Render a page region to pixels at 3× zoom and run Tesseract OCR on it.
+
+    This completely bypasses the PDF font-encoding layer, making it the only
+    reliable approach when invoices use custom glyph-to-Unicode mappings that
+    cause get_text() to return garbled output (e.g. "U:rrr&?8s" instead of
+    "Nº 51285").  Returns an empty string if Tesseract is unavailable or fails.
+    """
+    if not _TESS_OK:
+        return ""
+    try:
+        mat = fitz.Matrix(3, 3)  # 3× zoom → ~216 DPI for A4/Letter; enough for Tesseract
+        px_kwargs: dict = {"matrix": mat, "colorspace": fitz.csGRAY}
+        if clip is not None:
+            px_kwargs["clip"] = clip
+        pix = page.get_pixmap(**px_kwargs)
+        img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+        return _pytesseract.image_to_string(img, config="--oem 1 --psm 11")
+    except Exception:
+        return ""
+
+
 def _extract_si(doc: fitz.Document, idx: int) -> tuple[str, str]:
     page = doc[idx]
     h, w = page.rect.height, page.rect.width
 
-    # ── Priority 1: user-configured crop region ────────────────────────────────
+    # ── Priority 1: user-configured crop region (OCR first, then text layer) ──
     crop = _load_crop_region()
     if crop:
         clip = fitz.Rect(w * crop["x1"], h * crop["y1"], w * crop["x2"], h * crop["y2"])
+        if _TESS_OK:
+            si = _find_si(_ocr_text(page, clip))
+            if si:
+                return si, "ocr-crop"
         si = _find_si(_page_text(doc, idx, clip))
         if si:
             return si, "text-crop"
@@ -193,16 +238,28 @@ def _extract_si(doc: fitz.Document, idx: int) -> tuple[str, str]:
     si = _find_si(_page_text(doc, idx, fitz.Rect(0, h * 0.60, w, h)))
     if si:
         return si, "text-bottom"
+    if _TESS_OK:
+        si = _find_si(_ocr_text(page, fitz.Rect(0, h * 0.60, w, h)))
+        if si:
+            return si, "ocr-bottom"
 
     # ── Priority 3: right half of page ────────────────────────────────────────
     si = _find_si(_page_text(doc, idx, fitz.Rect(w * 0.50, 0, w, h)))
     if si:
         return si, "text-right"
+    if _TESS_OK:
+        si = _find_si(_ocr_text(page, fitz.Rect(w * 0.50, 0, w, h)))
+        if si:
+            return si, "ocr-right"
 
     # ── Priority 4: full page ─────────────────────────────────────────────────
     si = _find_si(_page_text(doc, idx))
     if si:
         return si, "text-full"
+    if _TESS_OK:
+        si = _find_si(_ocr_text(page))
+        if si:
+            return si, "ocr-full"
 
     # No SI found by any method — use fallback page name.
     return f"page_{idx + 1:04d}", "fallback"
@@ -439,7 +496,7 @@ def too_large(e):
 
 @app.get("/healthz")
 def healthz():
-    return jsonify({"status": "ok", "zbar": _ZBAR_OK, "ml4llm": _ML4LLM_OK})
+    return jsonify({"status": "ok", "zbar": _ZBAR_OK, "ml4llm": _ML4LLM_OK, "tesseract": _TESS_OK})
 
 
 @app.get("/")

@@ -4,6 +4,7 @@ FROM python:3.12-slim
 # ldconfig refreshes the linker cache so the .so is found at runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libzbar0 \
+    tesseract-ocr \
     && ldconfig \
     && rm -rf /var/lib/apt/lists/*
 
