@@ -1,5 +1,5 @@
 from __future__ import annotations
-import datetime, io, json, os, re, secrets, statistics, tempfile, threading, time, traceback, zipfile
+import base64, datetime, io, json, os, re, secrets, statistics, tempfile, threading, time, traceback, zipfile
 from pathlib import Path
 from flask import Flask, abort, jsonify, redirect, render_template, request, send_file, url_for
 
@@ -24,6 +24,35 @@ OPTIMIZE_LIMIT_MB = int(os.environ.get("OPTIMIZE_LIMIT_MB", 2048))  # Flask hard
 TMP_DIR           = Path(tempfile.gettempdir()) / "inv_sep"
 TMP_DIR.mkdir(exist_ok=True)
 RESULT_TTL = 3600  # seconds — local temp files expire after 1 hour
+
+# ── Crop-region config ─────────────────────────────────────────────────────────
+# Persisted alongside main.py so it survives container restarts.
+CROP_CONFIG_PATH = Path(__file__).parent / "crop_config.json"
+
+_crop_region_cache: dict | None = None
+_crop_region_mtime: float = 0.0
+
+
+def _load_crop_region() -> dict | None:
+    """Return saved crop region or None. Caches in memory; re-reads only on file change."""
+    global _crop_region_cache, _crop_region_mtime
+    try:
+        if CROP_CONFIG_PATH.exists():
+            mtime = CROP_CONFIG_PATH.stat().st_mtime
+            if mtime != _crop_region_mtime:
+                cfg = json.loads(CROP_CONFIG_PATH.read_text())
+                _crop_region_mtime = mtime
+                _crop_region_cache = (
+                    cfg
+                    if cfg.get("enabled") and all(k in cfg for k in ("x1", "y1", "x2", "y2"))
+                    else None
+                )
+            return _crop_region_cache
+        else:
+            _crop_region_cache = None
+            return None
+    except Exception:
+        return None
 
 # ── Customer-code mapping ──────────────────────────────────────────────────────
 # Maps a keyword found in the uploaded filename (case-insensitive) to the
@@ -85,35 +114,30 @@ def _extract_si(doc: fitz.Document, idx: int) -> tuple[str, str]:
     page = doc[idx]
     h, w = page.rect.height, page.rect.width
 
+    # ── Priority 1: user-configured crop region ────────────────────────────────
+    crop = _load_crop_region()
+    if crop:
+        clip = fitz.Rect(w * crop["x1"], h * crop["y1"], w * crop["x2"], h * crop["y2"])
+        si = _find_si(page.get_text("text", clip=clip))
+        if si:
+            return si, "text-crop"
+
+    # ── Priority 2: bottom 40 % of page ───────────────────────────────────────
     si = _find_si(page.get_text("text", clip=fitz.Rect(0, h * 0.60, w, h)))
     if si:
         return si, "text-bottom"
 
+    # ── Priority 3: right half of page ────────────────────────────────────────
     si = _find_si(page.get_text("text", clip=fitz.Rect(w * 0.50, 0, w, h)))
     if si:
         return si, "text-right"
 
+    # ── Priority 4: full page ─────────────────────────────────────────────────
     si = _find_si(page.get_text("text"))
     if si:
         return si, "text-full"
 
-    if _ZBAR_OK:
-        try:
-            mat = fitz.Matrix(2, 2)
-            pix = page.get_pixmap(matrix=mat, clip=fitz.Rect(0, h * 0.50, w, h), colorspace=fitz.csGRAY)
-            img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
-            codes = _pyzbar.decode(img)
-            if not codes:
-                pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), colorspace=fitz.csGRAY)
-                img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
-                codes = _pyzbar.decode(img)
-            for code in codes:
-                data = code.data.decode("utf-8", errors="ignore").strip()
-                if data:
-                    return _sanitize(data), "barcode"
-        except Exception:
-            pass
-
+    # Barcode reading disabled — use fallback page name instead.
     return f"page_{idx + 1:04d}", "fallback"
 
 
@@ -515,6 +539,84 @@ def download(token: str):
         return jsonify({"error": f"Could not generate download URL: {exc}"}), 500
 
     return redirect(signed_url, code=302)
+
+
+# ── Crop-region setup ─────────────────────────────────────────────────────────
+
+@app.get("/crop-setup")
+def crop_setup():
+    crop = _load_crop_region()
+    return render_template("crop_setup.html", current_crop=json.dumps(crop) if crop else "null")
+
+
+@app.post("/render-sample-page")
+def render_sample_page():
+    """Accept a PDF upload, render its first page as a base64 PNG for the crop UI."""
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify({"error": "No file provided"}), 400
+    if not f.filename.lower().endswith(".pdf"):
+        return jsonify({"error": "Only PDF files are accepted"}), 400
+    try:
+        pdf_bytes = f.read()
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        page = doc[0]
+        mat = fitz.Matrix(2, 2)  # render at 2× zoom for clarity
+        pix = page.get_pixmap(matrix=mat)
+        img_b64 = base64.b64encode(pix.tobytes("png")).decode("ascii")
+        page_w, page_h = page.rect.width, page.rect.height
+        doc.close()
+        return jsonify({
+            "image":      f"data:image/png;base64,{img_b64}",
+            "img_width":  pix.width,
+            "img_height": pix.height,
+            "page_width": page_w,
+            "page_height": page_h,
+        })
+    except Exception as exc:
+        return jsonify({"error": f"Failed to render page: {exc}"}), 500
+
+
+@app.post("/save-crop-region")
+def save_crop_region():
+    """Persist crop region (as page fractions 0–1) to crop_config.json."""
+    data = request.get_json(silent=True) or {}
+    try:
+        x1 = float(data["x1"])
+        y1 = float(data["y1"])
+        x2 = float(data["x2"])
+        y2 = float(data["y2"])
+    except (KeyError, ValueError, TypeError):
+        return jsonify({"error": "x1, y1, x2, y2 are required floats"}), 400
+
+    x1, y1, x2, y2 = (max(0.0, min(1.0, v)) for v in (x1, y1, x2, y2))
+    if x2 <= x1 or y2 <= y1:
+        return jsonify({"error": "Invalid region: x2 must be > x1 and y2 must be > y1"}), 400
+
+    cfg = {"x1": round(x1, 6), "y1": round(y1, 6),
+           "x2": round(x2, 6), "y2": round(y2, 6), "enabled": True}
+    CROP_CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    return jsonify({"ok": True, "region": cfg})
+
+
+@app.post("/disable-crop-region")
+def disable_crop_region():
+    """Disable (but preserve) the saved crop region."""
+    try:
+        if CROP_CONFIG_PATH.exists():
+            cfg = json.loads(CROP_CONFIG_PATH.read_text())
+            cfg["enabled"] = False
+            CROP_CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    except Exception:
+        pass
+    return jsonify({"ok": True})
+
+
+@app.get("/get-crop-region")
+def get_crop_region():
+    """Return current crop region config (or empty object if none)."""
+    crop = _load_crop_region()
+    return jsonify(crop or {})
 
 
 if __name__ == "__main__":

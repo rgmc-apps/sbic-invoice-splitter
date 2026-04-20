@@ -69,6 +69,10 @@
     <div class="actions">
       <button class="btn" id="uploadBtn" disabled>Process &amp; Split</button>
       <span style="color:var(--muted);font-size:14px">PDF only &nbsp;·&nbsp; No size limit</span>
+      <a href="/crop-setup" style="margin-left:auto;color:var(--navy);font-size:13px;font-weight:600;text-decoration:none;display:inline-flex;align-items:center;gap:5px">
+        <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18M15 3v18M3 9h18M3 15h18"/></svg>
+        Configure SI crop region
+      </a>
     </div>
 
     <!-- Progress panel (shown during upload + processing) -->
@@ -92,10 +96,10 @@
 
     <h3>SI extraction (tried in order)</h3>
     <ul>
+      <li><b>text-crop</b> — text from your <a href="/crop-setup" style="color:var(--navy)">configured crop region</a> (highest priority, if set).</li>
       <li><b>text-bottom</b> — text from the bottom 40 % of the page.</li>
       <li><b>text-right</b> — text from the right half.</li>
       <li><b>text-full</b> — full-page text.</li>
-      <li><b>barcode</b> — renders page as image and decodes any barcode.</li>
       <li><b>fallback</b> — page named <code>page_NNNN.pdf</code> if nothing found.</li>
     </ul>
 

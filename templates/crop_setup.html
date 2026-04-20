@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Configure SI Crop Region — Invoice Separator</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/cropperjs/dist/cropper.min.css" />
+  <style>
+    :root{ --navy:#0F4C81; --sand:#E2A867; --ink:#0b1220; --muted:#667085; --bg:#F7F9FC; --card:#FFFFFF; --border:#E5E7EB; --green:#16a34a; --red:#dc2626; }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+    .wrap{max-width:960px;margin:40px auto;padding:0 20px}
+    .header{display:flex;gap:14px;align-items:center;margin-bottom:10px}
+    .logo{width:44px;height:44px;border-radius:12px;object-fit:contain;background:#fff;border:1px solid var(--border);padding:4px}
+    h1{margin:0;font-size:24px}
+    .sub{color:var(--muted);margin:4px 0 20px}
+    .back{display:inline-flex;align-items:center;gap:6px;color:var(--navy);text-decoration:none;font-size:14px;margin-bottom:18px;font-weight:600}
+    .back:hover{text-decoration:underline}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:22px;box-shadow:0 6px 16px rgba(15,76,129,.08);margin-bottom:16px}
+    h2{margin:0 0 10px;font-size:18px}
+    p{margin:0 0 12px;color:var(--muted);font-size:14px}
+
+    /* ── Upload zone ── */
+    .drop-zone{border:2px dashed rgba(15,76,129,.30);border-radius:12px;padding:36px 20px;background:#fbfdff;text-align:center;transition:border-color .2s,background .2s;cursor:pointer}
+    .drop-zone.dragover{border-color:var(--navy);background:#eef4fc}
+    .drop-zone input[type=file]{display:none}
+    .drop-zone label{cursor:pointer;color:var(--navy);font-weight:600;text-decoration:underline}
+    .file-name{margin-top:8px;color:var(--muted);font-size:13px}
+
+    /* ── Buttons ── */
+    .btn{background:var(--navy);color:#fff;border:0;border-radius:10px;padding:10px 22px;font-weight:600;cursor:pointer;font-size:15px;transition:filter .15s;display:inline-block}
+    .btn:hover:not(:disabled){filter:brightness(1.08)}
+    .btn:disabled{opacity:.5;cursor:not-allowed}
+    .btn-sm{padding:7px 16px;font-size:13px;border-radius:8px}
+    .btn-danger{background:var(--red)}
+    .btn-success{background:var(--green)}
+    .btn-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px}
+
+    /* ── Cropper area ── */
+    #cropperSection{display:none}
+    .cropper-wrap{max-height:600px;overflow:hidden;border-radius:10px;border:1px solid var(--border);background:#111}
+    .cropper-wrap img{display:block;max-width:100%}
+    .crop-hint{font-size:13px;color:var(--muted);margin-top:8px}
+
+    /* ── Status / feedback ── */
+    .status-box{margin-top:12px;padding:12px 16px;border-radius:8px;font-size:14px;display:none}
+    .status-box.ok{background:#f0fdf4;border:1px solid #86efac;color:#166534}
+    .status-box.err{background:#fff0f0;border:1px solid #fca5a5;color:var(--red)}
+    .status-box.info{background:#eff6ff;border:1px solid #93c5fd;color:#1d4ed8}
+
+    /* ── Current region display ── */
+    .region-badge{display:inline-flex;align-items:center;gap:8px;background:#eff6ff;border:1px solid #93c5fd;color:#1d4ed8;border-radius:8px;padding:8px 14px;font-size:13px;font-family:monospace}
+    .region-none{color:var(--muted);font-size:14px;font-style:italic}
+
+    /* ── Loading spinner ── */
+    .spinner{display:inline-block;width:18px;height:18px;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:6px}
+    @keyframes spin{to{transform:rotate(360deg)}}
+
+    /* ── Steps ── */
+    .steps{counter-reset:step;list-style:none;padding:0;margin:0 0 12px}
+    .steps li{counter-increment:step;display:flex;align-items:flex-start;gap:10px;margin-bottom:8px;font-size:14px}
+    .steps li::before{content:counter(step);background:var(--navy);color:#fff;border-radius:50%;width:22px;height:22px;min-width:22px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;margin-top:1px}
+  </style>
+</head>
+<body>
+<div class="wrap">
+
+  <a class="back" href="/">&#8592; Back to Invoice Separator</a>
+
+  <div class="header">
+    <img class="logo" src="/static/logo.png" alt="RGMC Logo" onerror="this.style.display='none'">
+    <div>
+      <h1>Configure SI Crop Region</h1>
+      <div class="sub">Define the exact area of the page where the Sales Invoice number is printed.</div>
+    </div>
+  </div>
+
+  <!-- Current Region Status -->
+  <div class="card">
+    <h2>Current Region</h2>
+    <div id="currentRegionDisplay">
+      {% if current_crop != "null" %}
+        <div class="region-badge" id="regionBadge">
+          &#10003;&nbsp; Active &nbsp;|&nbsp;
+          x: <b id="rx1"></b>–<b id="rx2"></b> &nbsp; y: <b id="ry1"></b>–<b id="ry2"></b>
+        </div>
+        <div class="btn-row" style="margin-top:10px">
+          <button class="btn btn-sm btn-danger" id="disableBtn">Disable crop region</button>
+        </div>
+      {% else %}
+        <div class="region-none" id="regionNone">No crop region configured — all default extraction zones are used.</div>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- How to configure -->
+  <div class="card">
+    <h2>Set a New Crop Region</h2>
+    <ol class="steps">
+      <li>Upload any sample invoice PDF from your batch (only the first page is used).</li>
+      <li>Draw a rectangle around the area that contains the SI number.</li>
+      <li>Click <b>Save Region</b> — this region will be checked <b>first</b> on every page going forward.</li>
+    </ol>
+
+    <!-- Step 1: upload sample PDF -->
+    <div class="drop-zone" id="dropZone">
+      <input type="file" id="pdfInput" accept=".pdf">
+      <svg width="36" height="36" fill="none" stroke="#0F4C81" stroke-width="1.5" viewBox="0 0 24 24" style="display:block;margin:0 auto 8px">
+        <path d="M12 16V8m0 0-3 3m3-3 3 3M20 16.7A4 4 0 0 0 18 9h-1.26A7 7 0 1 0 5 15.7"/>
+      </svg>
+      <div>Drag &amp; drop a sample PDF, or <label for="pdfInput">browse</label></div>
+      <div class="file-name" id="fileName">No file chosen</div>
+    </div>
+
+    <div class="btn-row">
+      <button class="btn btn-sm" id="loadBtn" disabled>Load sample page</button>
+      <span id="loadSpinner" style="display:none"><span class="spinner"></span> Rendering…</span>
+    </div>
+
+    <div class="status-box" id="loadStatus"></div>
+  </div>
+
+  <!-- Step 2 + 3: cropper -->
+  <div class="card" id="cropperSection">
+    <h2>Draw the crop region</h2>
+    <p>Drag to move and resize the selection box until it tightly covers the SI number field.</p>
+
+    <div class="cropper-wrap">
+      <img id="cropImg" src="" alt="Invoice page preview" />
+    </div>
+    <div class="crop-hint">Tip: zoom in or resize your browser window if the page is hard to see.</div>
+
+    <div class="btn-row">
+      <button class="btn btn-success" id="saveBtn">Save Region</button>
+      <button class="btn btn-sm" id="resetCropBtn" style="background:#6b7280">Reset selection</button>
+    </div>
+    <div class="status-box" id="saveStatus"></div>
+  </div>
+
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/cropperjs/dist/cropper.min.js"></script>
+<script>
+  // ── DOM refs ────────────────────────────────────────────────────────────────
+  const dropZone   = document.getElementById('dropZone');
+  const pdfInput   = document.getElementById('pdfInput');
+  const fileName   = document.getElementById('fileName');
+  const loadBtn    = document.getElementById('loadBtn');
+  const loadSpinner= document.getElementById('loadSpinner');
+  const loadStatus = document.getElementById('loadStatus');
+  const cropSection= document.getElementById('cropperSection');
+  const cropImg    = document.getElementById('cropImg');
+  const saveBtn    = document.getElementById('saveBtn');
+  const resetCropBtn = document.getElementById('resetCropBtn');
+  const saveStatus = document.getElementById('saveStatus');
+  const disableBtn = document.getElementById('disableBtn');
+
+  // ── State ───────────────────────────────────────────────────────────────────
+  let cropper = null;
+  let imgNaturalW = 0;
+  let imgNaturalH = 0;
+
+  // ── Restore current region labels ───────────────────────────────────────────
+  const savedCrop = {{ current_crop|safe }};
+  if (savedCrop) {
+    const pct = v => (v * 100).toFixed(1) + '%';
+    document.getElementById('rx1').textContent = pct(savedCrop.x1);
+    document.getElementById('rx2').textContent = pct(savedCrop.x2);
+    document.getElementById('ry1').textContent = pct(savedCrop.y1);
+    document.getElementById('ry2').textContent = pct(savedCrop.y2);
+  }
+
+  // ── Helpers ─────────────────────────────────────────────────────────────────
+  function showStatus(el, msg, type) {
+    el.textContent = msg;
+    el.className = 'status-box ' + type;
+    el.style.display = 'block';
+  }
+
+  // ── File pick / drag-drop ───────────────────────────────────────────────────
+  pdfInput.addEventListener('change', () => {
+    if (pdfInput.files[0]) {
+      fileName.textContent = pdfInput.files[0].name;
+      loadBtn.disabled = false;
+      loadStatus.style.display = 'none';
+    }
+  });
+
+  dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropZone.classList.remove('dragover');
+    const f = e.dataTransfer.files[0];
+    if (f && f.name.toLowerCase().endsWith('.pdf')) {
+      const dt = new DataTransfer();
+      dt.items.add(f);
+      pdfInput.files = dt.files;
+      fileName.textContent = f.name;
+      loadBtn.disabled = false;
+      loadStatus.style.display = 'none';
+    } else {
+      showStatus(loadStatus, 'Please drop a PDF file.', 'err');
+    }
+  });
+
+  // ── Load sample page ─────────────────────────────────────────────────────────
+  loadBtn.addEventListener('click', async () => {
+    const file = pdfInput.files[0];
+    if (!file) return;
+
+    loadBtn.disabled = true;
+    loadSpinner.style.display = 'inline';
+    loadStatus.style.display = 'none';
+
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      const resp = await fetch('/render-sample-page', { method: 'POST', body: fd });
+      const data = await resp.json();
+
+      if (data.error) {
+        showStatus(loadStatus, '✗ ' + data.error, 'err');
+        return;
+      }
+
+      // Store natural dimensions for fraction calculation
+      imgNaturalW = data.img_width;
+      imgNaturalH = data.img_height;
+
+      // Destroy previous cropper if any
+      if (cropper) { cropper.destroy(); cropper = null; }
+
+      // Set image source
+      cropImg.src = data.image;
+      cropSection.style.display = 'block';
+      cropSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+      // Init Cropper.js after image loads
+      cropImg.onload = () => {
+        cropper = new Cropper(cropImg, {
+          viewMode: 1,       // restrict crop box to canvas
+          dragMode: 'move',  // pan by default; draw on create
+          autoCropArea: 0.25, // start with a small selection
+          movable: true,
+          rotatable: false,
+          scalable: false,
+          zoomable: false,
+          guides: true,
+          center: true,
+          highlight: true,
+          cropBoxMovable: true,
+          cropBoxResizable: true,
+        });
+      };
+
+      showStatus(loadStatus, '✓ Page loaded — draw your selection below.', 'ok');
+
+    } catch (err) {
+      showStatus(loadStatus, '✗ ' + err.message, 'err');
+    } finally {
+      loadBtn.disabled = false;
+      loadSpinner.style.display = 'none';
+    }
+  });
+
+  // ── Reset crop box ──────────────────────────────────────────────────────────
+  resetCropBtn.addEventListener('click', () => {
+    if (cropper) cropper.reset();
+  });
+
+  // ── Save region ──────────────────────────────────────────────────────────────
+  saveBtn.addEventListener('click', async () => {
+    if (!cropper) return;
+
+    const box = cropper.getCropBoxData();   // pixels relative to canvas
+    const canvasData = cropper.getCanvasData(); // canvas position/size in container
+
+    // Convert crop box (canvas-relative) to fractions of the rendered image
+    const x1 = (box.left - canvasData.left) / canvasData.width;
+    const y1 = (box.top  - canvasData.top)  / canvasData.height;
+    const x2 = x1 + box.width  / canvasData.width;
+    const y2 = y1 + box.height / canvasData.height;
+
+    // Clamp
+    const clamp = v => Math.max(0, Math.min(1, v));
+    const region = {
+      x1: clamp(x1), y1: clamp(y1),
+      x2: clamp(x2), y2: clamp(y2),
+    };
+
+    if (region.x2 - region.x1 < 0.01 || region.y2 - region.y1 < 0.01) {
+      showStatus(saveStatus, '✗ Selection is too small. Please draw a larger area.', 'err');
+      return;
+    }
+
+    saveBtn.disabled = true;
+    saveStatus.style.display = 'none';
+
+    try {
+      const resp = await fetch('/save-crop-region', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(region),
+      });
+      const data = await resp.json();
+
+      if (data.error) {
+        showStatus(saveStatus, '✗ ' + data.error, 'err');
+      } else {
+        const r = data.region;
+        const pct = v => (v * 100).toFixed(1) + '%';
+        showStatus(saveStatus,
+          `✓ Crop region saved! x: ${pct(r.x1)}–${pct(r.x2)}, y: ${pct(r.y1)}–${pct(r.y2)}. ` +
+          `This region will be checked first on every invoice page.`,
+          'ok'
+        );
+        // Reload to update "Current Region" panel
+        setTimeout(() => window.location.reload(), 1500);
+      }
+    } catch (err) {
+      showStatus(saveStatus, '✗ ' + err.message, 'err');
+    } finally {
+      saveBtn.disabled = false;
+    }
+  });
+
+  // ── Disable region ──────────────────────────────────────────────────────────
+  if (disableBtn) {
+    disableBtn.addEventListener('click', async () => {
+      disableBtn.disabled = true;
+      try {
+        await fetch('/disable-crop-region', { method: 'POST' });
+        window.location.reload();
+      } catch (_) {
+        disableBtn.disabled = false;
+      }
+    });
+  }
+</script>
+</body>
+</html>
