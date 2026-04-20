@@ -7,7 +7,7 @@ import fitz  # PyMuPDF
 import google.auth
 import google.auth.transport.requests as _google_requests
 from google.cloud import storage as gcs
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 
 # pyzbar needs the native libzbar0 shared library.
 # Import it optionally so a missing system library doesn't crash startup;
@@ -151,6 +151,21 @@ _SI_RE = [
 ]
 
 
+# ── OCR digit-normalization ────────────────────────────────────────────────────
+# Tesseract often mistakes digits for visually similar letters (e.g. "5" → "S",
+# "0" → "O", "8" → "B").  We correct these only inside sequences that are
+# already 4+ characters of digits/digit-like letters, so short label words
+# ("SI", "No") are never touched.
+_OCR_DIGIT_MAP = str.maketrans('SOsoQIlBGZ', '5005001862')
+
+
+def _ocr_clean(text: str) -> str:
+    """Fix letter-for-digit OCR mistakes in numeric-looking sequences."""
+    def _fix(m: re.Match) -> str:
+        return m.group().translate(_OCR_DIGIT_MAP)
+    return re.sub(r'[0-9SOsoQIlBGZ]{4,}', _fix, text)
+
+
 def _sanitize(name: str) -> str:
     return re.sub(r'[\\/*?:"<>|\r\n\t]', '_', name).strip().strip('._')[:80] or "unknown"
 
@@ -223,24 +238,38 @@ def _page_text(doc: fitz.Document, idx: int, clip: fitz.Rect | None = None) -> s
     return page.get_text("text")
 
 
-def _ocr_text(page: fitz.Page, clip: fitz.Rect | None = None) -> str:
+def _ocr_text(page: fitz.Page, clip: fitz.Rect | None = None, psm: int = 11) -> str:
     """Render a page region to pixels at 3× zoom and run Tesseract OCR on it.
 
     This completely bypasses the PDF font-encoding layer, making it the only
     reliable approach when invoices use custom glyph-to-Unicode mappings that
     cause get_text() to return garbled output (e.g. "U:rrr&?8s" instead of
     "Nº 51285").  Returns an empty string if Tesseract is unavailable or fails.
+
+    psm controls Tesseract's page-segmentation mode:
+      6 = single uniform text block (best for small crop regions)
+     11 = sparse text, find as much as possible (best for large/full-page regions)
     """
     if not _TESS_OK:
         return ""
     try:
-        mat = fitz.Matrix(3, 3)  # 3× zoom → ~216 DPI for A4/Letter; enough for Tesseract
+        mat = fitz.Matrix(3, 3)  # 3× zoom → ~216 DPI for A4/Letter
         px_kwargs: dict = {"matrix": mat, "colorspace": fitz.csGRAY}
         if clip is not None:
             px_kwargs["clip"] = clip
         pix = page.get_pixmap(**px_kwargs)
         img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
-        return _pytesseract.image_to_string(img, config="--oem 1 --psm 11")
+
+        # Sharpen edges, then boost contrast — both improve digit recognition
+        # on invoice text that may be printed small or at low contrast.
+        img = img.filter(ImageFilter.SHARPEN)
+        img = ImageEnhance.Contrast(img).enhance(2.0)
+
+        raw = _pytesseract.image_to_string(img, config=f"--oem 1 --psm {psm}")
+
+        # Correct common letter-for-digit OCR mistakes (e.g. "S"→"5", "O"→"0")
+        # before the text is passed to the SI-number regex patterns.
+        return _ocr_clean(raw)
     except Exception:
         return ""
 
@@ -254,7 +283,9 @@ def _extract_si(doc: fitz.Document, idx: int) -> tuple[str, str]:
     if crop:
         clip = fitz.Rect(w * crop["x1"], h * crop["y1"], w * crop["x2"], h * crop["y2"])
         if _TESS_OK:
-            si = _find_si(_ocr_text(page, clip))
+            # psm=6: treat the small crop zone as a single uniform text block —
+            # more accurate than psm=11 (sparse) on a tight, well-defined region.
+            si = _find_si(_ocr_text(page, clip, psm=6))
             if si:
                 return si, "ocr-crop"
         si = _find_si(_page_text(doc, idx, clip))
