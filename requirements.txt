@@ -1,5 +1,6 @@
 flask==3.*
 pymupdf==1.*
+pymupdf4llm>=0.0.17
 pyzbar==0.1.*
 Pillow==10.*
 gunicorn==21.*

@@ -19,6 +19,17 @@ except Exception:
     _pyzbar = None  # type: ignore[assignment]
     _ZBAR_OK = False
 
+# pymupdf4llm provides layout-aware, markdown-formatted text extraction that
+# preserves table structure and reading order — significantly better than the
+# raw get_text("text") approach for structured invoice documents.
+# Import optionally so the service starts even if the package is absent.
+try:
+    import pymupdf4llm as _pymupdf4llm
+    _ML4LLM_OK = True
+except Exception:
+    _pymupdf4llm = None  # type: ignore[assignment]
+    _ML4LLM_OK = False
+
 UPLOAD_BUCKET     = os.environ.get("UPLOAD_BUCKET", "sbic-splitter-uploads")
 OPTIMIZE_LIMIT_MB = int(os.environ.get("OPTIMIZE_LIMIT_MB", 2048))  # Flask hard cap for /optimize-only
 TMP_DIR           = Path(tempfile.gettempdir()) / "inv_sep"
@@ -110,6 +121,62 @@ def _find_si(text: str) -> str | None:
     return None
 
 
+def _strip_markdown(text: str) -> str:
+    """Remove markdown formatting so the SI regex patterns work on clean text.
+
+    pymupdf4llm returns markdown that includes bold markers (**), heading
+    markers (#), table-cell separators (|), alignment rows (|:---|), and
+    code fences (```).  Stripping these gives plain prose that the existing
+    _SI_RE patterns can match without modification.
+    """
+    # Fenced code blocks — remove the whole block, not just the backticks
+    text = re.sub(r'```[\s\S]*?```', ' ', text)
+    text = re.sub(r'~~~[\s\S]*?~~~', ' ', text)
+    # Inline code
+    text = re.sub(r'`[^`\n]*`', ' ', text)
+    # Bold / italic / bold-italic (order matters: longest first)
+    text = re.sub(r'\*{1,3}', '', text)
+    text = re.sub(r'_{1,2}', '', text)
+    # ATX headings (# Heading)
+    text = re.sub(r'^#{1,6}[ \t]*', '', text, flags=re.MULTILINE)
+    # Table alignment rows  (|:---|:---| …)
+    text = re.sub(r'^\|[\s:|\\-]+\|\s*$', '', text, flags=re.MULTILINE)
+    # Table cell separators → space so "| SI No | 12345 |" → " SI No  12345 "
+    text = re.sub(r'\|', ' ', text)
+    # Blockquote markers
+    text = re.sub(r'^>[ \t]*', '', text, flags=re.MULTILINE)
+    # Setext / thematic break lines (--- *** ___)
+    text = re.sub(r'^[-*_]{3,}\s*$', '', text, flags=re.MULTILINE)
+    # Collapse runs of horizontal whitespace to a single space per line
+    text = re.sub(r'[^\S\n]+', ' ', text)
+    return text.strip()
+
+
+def _page_text(doc: fitz.Document, idx: int, clip: fitz.Rect | None = None) -> str:
+    """Extract text from a page region.
+
+    Tries pymupdf4llm first (layout-aware, table-preserving markdown output,
+    then stripped clean) and falls back to PyMuPDF's native get_text() if
+    pymupdf4llm is unavailable or returns nothing for that region.
+    """
+    if _ML4LLM_OK:
+        try:
+            kwargs: dict = {"pages": [idx]}
+            if clip is not None:
+                kwargs["clip"] = clip
+            md = _pymupdf4llm.to_markdown(doc, **kwargs)
+            stripped = _strip_markdown(md)
+            if stripped:
+                return stripped
+        except Exception:
+            pass  # fall through to get_text()
+
+    page = doc[idx]
+    if clip is not None:
+        return page.get_text("text", clip=clip)
+    return page.get_text("text")
+
+
 def _extract_si(doc: fitz.Document, idx: int) -> tuple[str, str]:
     page = doc[idx]
     h, w = page.rect.height, page.rect.width
@@ -118,26 +185,26 @@ def _extract_si(doc: fitz.Document, idx: int) -> tuple[str, str]:
     crop = _load_crop_region()
     if crop:
         clip = fitz.Rect(w * crop["x1"], h * crop["y1"], w * crop["x2"], h * crop["y2"])
-        si = _find_si(page.get_text("text", clip=clip))
+        si = _find_si(_page_text(doc, idx, clip))
         if si:
             return si, "text-crop"
 
     # ── Priority 2: bottom 40 % of page ───────────────────────────────────────
-    si = _find_si(page.get_text("text", clip=fitz.Rect(0, h * 0.60, w, h)))
+    si = _find_si(_page_text(doc, idx, fitz.Rect(0, h * 0.60, w, h)))
     if si:
         return si, "text-bottom"
 
     # ── Priority 3: right half of page ────────────────────────────────────────
-    si = _find_si(page.get_text("text", clip=fitz.Rect(w * 0.50, 0, w, h)))
+    si = _find_si(_page_text(doc, idx, fitz.Rect(w * 0.50, 0, w, h)))
     if si:
         return si, "text-right"
 
     # ── Priority 4: full page ─────────────────────────────────────────────────
-    si = _find_si(page.get_text("text"))
+    si = _find_si(_page_text(doc, idx))
     if si:
         return si, "text-full"
 
-    # Barcode reading disabled — use fallback page name instead.
+    # No SI found by any method — use fallback page name.
     return f"page_{idx + 1:04d}", "fallback"
 
 
@@ -372,7 +439,7 @@ def too_large(e):
 
 @app.get("/healthz")
 def healthz():
-    return jsonify({"status": "ok", "zbar": _ZBAR_OK})
+    return jsonify({"status": "ok", "zbar": _ZBAR_OK, "ml4llm": _ML4LLM_OK})
 
 
 @app.get("/")
