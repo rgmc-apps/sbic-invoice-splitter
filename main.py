@@ -1,5 +1,5 @@
 from __future__ import annotations
-import base64, datetime, io, json, os, re, secrets, statistics, tempfile, threading, time, traceback, zipfile
+import base64, concurrent.futures, datetime, io, json, os, re, secrets, statistics, tempfile, threading, time, traceback, zipfile
 from pathlib import Path
 from flask import Flask, abort, jsonify, redirect, render_template, request, send_file, url_for
 
@@ -218,27 +218,29 @@ def _strip_markdown(text: str) -> str:
 
 
 def _page_text(doc: fitz.Document, idx: int, clip: fitz.Rect | None = None) -> str:
-    """Extract text from a page region.
+    """Extract text from a page or a clipped region.
 
-    Tries pymupdf4llm first (layout-aware, table-preserving markdown output,
-    then stripped clean) and falls back to PyMuPDF's native get_text() if
-    pymupdf4llm is unavailable or returns nothing for that region.
+    For clip regions, PyMuPDF's native get_text() is used directly — it is an
+    order of magnitude faster than pymupdf4llm for tight rectangular regions
+    and avoids the full layout-analysis pass that to_markdown() performs.
+
+    For full-page extraction (clip=None), pymupdf4llm is tried first because
+    its table-aware layout pass can reconstruct reading order that get_text()
+    misses on structured invoice layouts.
     """
+    page = doc[idx]
+    if clip is not None:
+        return page.get_text("text", clip=clip)
+
+    # Full-page: try pymupdf4llm for better layout/table awareness.
     if _ML4LLM_OK:
         try:
-            kwargs: dict = {"pages": [idx]}
-            if clip is not None:
-                kwargs["clip"] = clip
-            md = _pymupdf4llm.to_markdown(doc, **kwargs)
+            md = _pymupdf4llm.to_markdown(doc, pages=[idx])
             stripped = _strip_markdown(md)
             if stripped:
                 return stripped
         except Exception:
-            pass  # fall through to get_text()
-
-    page = doc[idx]
-    if clip is not None:
-        return page.get_text("text", clip=clip)
+            pass
     return page.get_text("text")
 
 
@@ -450,17 +452,42 @@ def _optimize_pdf(pdf_bytes: bytes) -> bytes:
     return optimized if len(optimized) < len(pdf_bytes) else pdf_bytes
 
 
+def _extract_si_worker(pdf_bytes: bytes, idx: int) -> tuple[int, tuple[str, str]]:
+    """Open an independent Document and extract the SI for one page.
+
+    fitz.Document is not thread-safe for concurrent access, so each parallel
+    worker opens its own copy from the shared bytes buffer (no extra I/O).
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        result = _extract_si(doc, idx)
+    finally:
+        doc.close()
+    return idx, result
+
+
 def process_pdf(pdf_bytes: bytes, customer_code: str) -> tuple[list[dict], bytes]:
     """Split every page into its own PDF named SI_{customer_code}_{si_number}.pdf."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page_count = doc.page_count
+    doc.close()
 
-    # ── Pass 1: extract SI from every page individually ───────────────────────
-    raw: list[tuple[str, str]] = [_extract_si(doc, i) for i in range(doc.page_count)]
+    # ── Pass 1: extract SI from all pages in parallel ─────────────────────────
+    # Cap workers at 4: each opens its own in-memory Document (~pdf_bytes RAM),
+    # and Tesseract is CPU-bound, so more than 4 yields diminishing returns.
+    raw: list[tuple[str, str]] = [("", "")] * page_count
+    workers = min(4, page_count)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(_extract_si_worker, pdf_bytes, i): i for i in range(page_count)}
+        for fut in concurrent.futures.as_completed(futs):
+            idx, result = fut.result()
+            raw[idx] = result
 
     # ── Pass 2: fill fallback pages via consecutive-sequence inference ─────────
     raw = _infer_from_sequence(raw)
 
     # ── Pass 3: build ZIP with final filenames ────────────────────────────────
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     results: list[dict] = []
     used: dict[str, int] = {}
     zip_buf = io.BytesIO()
@@ -476,11 +503,11 @@ def process_pdf(pdf_bytes: bytes, customer_code: str) -> tuple[list[dict], bytes
 
             single = fitz.open()
             single.insert_pdf(doc, from_page=i, to_page=i)
-            page_bytes = single.tobytes(deflate=True)
+            page_bytes_page = single.tobytes(deflate=True)
             single.close()
 
             filename = f"SI_{customer_code}_{si}.pdf"
-            zf.writestr(filename, page_bytes)
+            zf.writestr(filename, page_bytes_page)
             results.append({"page": i + 1, "si": si, "filename": filename, "method": method})
 
     doc.close()
