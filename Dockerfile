@@ -19,5 +19,6 @@ COPY . .
 ENV PORT=8080
 
 # 1 worker + 8 threads suits Cloud Run's per-instance concurrency model.
-# Timeout 300s to accommodate large PDF uploads and processing.
-CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 300 main:app
+# Processing runs in background threads so HTTP requests are short-lived;
+# 120s timeout covers GCS downloads and status polling overhead.
+CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 120 main:app

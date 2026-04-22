@@ -47,6 +47,10 @@ OPTIMIZE_LIMIT_MB = int(os.environ.get("OPTIMIZE_LIMIT_MB", 2048))  # Flask hard
 TMP_DIR           = Path(tempfile.gettempdir()) / "inv_sep"
 TMP_DIR.mkdir(exist_ok=True)
 RESULT_TTL = 3600  # seconds — local temp files expire after 1 hour
+JOB_TTL    = 3600  # seconds — in-memory job entries expire after 1 hour
+
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
 
 # ── Crop-region config ─────────────────────────────────────────────────────────
 # Persisted alongside main.py so it survives container restarts.
@@ -492,6 +496,70 @@ def _cleanup_old_files() -> None:
                 p.unlink()
         except OSError:
             pass
+    with _jobs_lock:
+        stale = [jid for jid, j in _jobs.items() if now - j.get("created", now) > JOB_TTL]
+        for jid in stale:
+            del _jobs[jid]
+
+
+def _process_job(job_id: str, blob_name: str, filename: str) -> None:
+    """Background worker: download → optimise → split → save.  Updates _jobs[job_id]."""
+    def _fail(error: str, cause: str, hint: str) -> None:
+        with _jobs_lock:
+            _jobs[job_id].update({
+                "status": "error", "error": error, "cause": cause,
+                "hint": hint, "detail": traceback.format_exc(),
+            })
+
+    try:
+        try:
+            pdf_bytes     = _storage().bucket(UPLOAD_BUCKET).blob(blob_name).download_as_bytes()
+            original_size = len(pdf_bytes)
+        except Exception as exc:
+            _fail(
+                f"Failed to download file from cloud storage: {exc}", "gcs_download",
+                "The upload may have failed or the signed URL expired. Try uploading again.",
+            )
+            return
+
+        try:
+            customer_code  = _resolve_customer_code(filename)
+            pdf_bytes      = _optimize_pdf(pdf_bytes)
+            optimized_size = len(pdf_bytes)
+        except MemoryError:
+            _fail(
+                "Out of memory while optimising the PDF.", "oom_optimize",
+                "Increase the Cloud Run instance memory to 2 GB or higher.",
+            )
+            return
+        except Exception as exc:
+            _fail(
+                f"PDF optimisation failed: {exc}", "optimization",
+                "The file may be corrupt or password-protected.",
+            )
+            return
+
+        try:
+            results, zip_bytes = process_pdf(pdf_bytes, customer_code)
+        except MemoryError:
+            _fail(
+                "Out of memory while splitting the PDF.", "oom_split",
+                "Increase the Cloud Run instance memory to 2 GB or higher.",
+            )
+            return
+        except Exception as exc:
+            _fail(
+                f"PDF splitting failed: {exc}", "split",
+                "The PDF may be corrupt, encrypted, or contain unsupported content.",
+            )
+            return
+
+        token = _save_result(results, zip_bytes, original_size, optimized_size, filename)
+        with _jobs_lock:
+            _jobs[job_id].update({"status": "done", "token": token})
+
+    except Exception as exc:
+        _fail(f"Unexpected error: {exc}", "unexpected", "Please try again.")
 
 
 # ── Google Cloud Storage ───────────────────────────────────────────────────────
@@ -664,8 +732,9 @@ def request_upload_url():
 @app.post("/process")
 def process():
     """
-    Step 2 — read the already-uploaded blob from GCS, optimise, split, return token.
-    Request body is tiny JSON; only the GCS→Cloud Run download happens here.
+    Step 2 — enqueue a background job and return a job_id immediately.
+    The client polls GET /status/<job_id> until status is 'done' or 'error'.
+    This avoids 504 timeouts on large PDFs that take several minutes to process.
     """
     _cleanup_old_files()
     data = request.get_json(silent=True) or {}
@@ -675,60 +744,22 @@ def process():
     if not blob_name:
         return jsonify({"error": "blob_name is required"}), 400
 
-    # ── Step A: download from GCS ──────────────────────────────────────────────
-    try:
-        pdf_bytes     = _storage().bucket(UPLOAD_BUCKET).blob(blob_name).download_as_bytes()
-        original_size = len(pdf_bytes)
-    except Exception as exc:
-        return jsonify({
-            "error":  f"Failed to download file from cloud storage: {exc}",
-            "cause":  "gcs_download",
-            "hint":   "The upload may have failed or the signed URL expired. Try uploading again.",
-            "detail": traceback.format_exc(),
-        }), 502
+    job_id = secrets.token_urlsafe(16)
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "processing", "token": None, "created": time.time()}
 
-    # ── Step B: lossless optimisation ─────────────────────────────────────────
-    try:
-        customer_code  = _resolve_customer_code(filename)
-        pdf_bytes      = _optimize_pdf(pdf_bytes)
-        optimized_size = len(pdf_bytes)
-    except MemoryError:
-        return jsonify({
-            "error":  "Out of memory while optimising the PDF.",
-            "cause":  "oom_optimize",
-            "hint":   "The file is too large for the current Cloud Run memory limit. "
-                      "Increase the instance memory to 2 GB or higher in the Cloud Run service settings.",
-            "detail": traceback.format_exc(),
-        }), 500
-    except Exception as exc:
-        return jsonify({
-            "error":  f"PDF optimisation failed: {exc}",
-            "cause":  "optimization",
-            "hint":   "The file may be corrupt or password-protected.",
-            "detail": traceback.format_exc(),
-        }), 500
+    threading.Thread(target=_process_job, args=(job_id, blob_name, filename), daemon=True).start()
+    return jsonify({"job_id": job_id, "status": "processing"})
 
-    # ── Step C: split pages ────────────────────────────────────────────────────
-    try:
-        results, zip_bytes = process_pdf(pdf_bytes, customer_code)
-    except MemoryError:
-        return jsonify({
-            "error":  "Out of memory while splitting the PDF.",
-            "cause":  "oom_split",
-            "hint":   "The file is too large for the current Cloud Run memory limit. "
-                      "Increase the instance memory to 2 GB or higher in the Cloud Run service settings.",
-            "detail": traceback.format_exc(),
-        }), 500
-    except Exception as exc:
-        return jsonify({
-            "error":  f"PDF splitting failed: {exc}",
-            "cause":  "split",
-            "hint":   "The PDF may be corrupt, encrypted, or contain unsupported content.",
-            "detail": traceback.format_exc(),
-        }), 500
 
-    token = _save_result(results, zip_bytes, original_size, optimized_size, filename)
-    return jsonify({"token": token})
+@app.get("/status/<job_id>")
+def job_status(job_id):
+    """Poll the status of an async processing job."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify({k: v for k, v in job.items() if k != "created"})
 
 
 # ── Optimize-only (compress and return — no splitting) ────────────────────────

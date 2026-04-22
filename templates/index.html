@@ -298,29 +298,41 @@
         xhr.send(file);
       });
 
-      // Step 3: trigger server-side processing
-      setStep('Optimising and splitting pages\u2026', 75, 'This may take a moment for large files\u2026');
+      // Step 3: enqueue processing job (returns immediately — no timeout risk)
+      setStep('Starting processing\u2026', 75, '');
       const procResp = await fetch('/process', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ blob_name, filename: file.name }),
       });
       if (!procResp.ok) {
-        if (procResp.status === 503) {
-          showError(
-            'Processing timed out (503 Service Unavailable).', '503',
-            'Cloud Run terminated the request before it finished. To fix: open the Cloud Run service in GCP Console \u2192 Edit & Deploy New Revision \u2192 set Request timeout to 300 s (or higher) and Memory to 2 GiB or more.',
-            null
-          );
-          return;
-        }
         let body = {};
         try { body = await procResp.json(); } catch (_) {}
         showError(body.error || `Processing failed (${procResp.status})`, body.cause||null, body.hint||null, body.detail||null);
         return;
       }
-      const { token, error: procErr } = await procResp.json();
+      const { job_id, error: procErr } = await procResp.json();
       if (procErr) { showError(procErr); return; }
+
+      // Step 3b: poll until done
+      const dots = ['\u2026', '.\u2009.\u2009.', '. .\u2009.', '. . .'];
+      let dotIdx = 0;
+      let token = null;
+      while (true) {
+        await new Promise(r => setTimeout(r, 3000));
+        dotIdx = (dotIdx + 1) % dots.length;
+        setStep(`Optimising and splitting pages ${dots[dotIdx]}`, 80, 'This may take a few minutes for large files.');
+        let statusData;
+        try {
+          const sResp = await fetch(`/status/${job_id}`);
+          statusData = await sResp.json();
+        } catch (_) { continue; }
+        if (statusData.status === 'done') { token = statusData.token; break; }
+        if (statusData.status === 'error') {
+          showError(statusData.error || 'Processing failed', statusData.cause||null, statusData.hint||null, statusData.detail||null);
+          return;
+        }
+      }
 
       // Step 4: redirect to results
       setStep('Done! Redirecting\u2026', 100, '');
