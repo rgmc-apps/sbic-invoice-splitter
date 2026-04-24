@@ -51,6 +51,7 @@ JOB_TTL    = 3600  # seconds — in-memory job entries expire after 1 hour
 
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
+_MAX_WORKERS = int(os.environ.get("MAX_WORKERS", min(os.cpu_count() or 4, 8)))
 
 # ── Crop-region config ─────────────────────────────────────────────────────────
 # Persisted alongside main.py so it survives container restarts.
@@ -338,9 +339,21 @@ def _extract_si(doc: fitz.Document, idx: int) -> tuple[str, str]:
             return si, "ocr-right"
 
     # ── Priority 4: full page ─────────────────────────────────────────────────
-    si = _find_si(_page_text(doc, idx))
+    # Fast path: native get_text() skips pymupdf4llm's layout analysis pass.
+    # Only invoke the expensive table-aware pass when the fast path misses.
+    fast_text = page.get_text("text")
+    si = _find_si(fast_text)
     if si:
         return si, "text-full"
+    if _ML4LLM_OK:
+        try:
+            md = _pymupdf4llm.to_markdown(doc, pages=[idx])
+            stripped = _strip_markdown(md)
+            si = _find_si(stripped)
+            if si:
+                return si, "text-full"
+        except Exception:
+            pass
     if _TESS_OK:
         si = _find_si(_ocr_text(page))
         if si:
@@ -452,18 +465,22 @@ def _optimize_pdf(pdf_bytes: bytes) -> bytes:
     return optimized if len(optimized) < len(pdf_bytes) else pdf_bytes
 
 
-def _extract_si_worker(pdf_bytes: bytes, idx: int) -> tuple[int, tuple[str, str]]:
-    """Open an independent Document and extract the SI for one page.
+def _extract_si_and_bytes_worker(pdf_bytes: bytes, idx: int) -> tuple[int, tuple[str, str], bytes]:
+    """Open an independent Document, extract the SI, and export the page as bytes.
 
-    fitz.Document is not thread-safe for concurrent access, so each parallel
-    worker opens its own copy from the shared bytes buffer (no extra I/O).
+    Combining both operations in a single document open eliminates the separate
+    sequential ZIP-building pass that previously re-opened the full PDF for every page.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
-        result = _extract_si(doc, idx)
+        si_result = _extract_si(doc, idx)
+        single = fitz.open()
+        single.insert_pdf(doc, from_page=idx, to_page=idx)
+        page_data = single.tobytes(deflate=True)
+        single.close()
     finally:
         doc.close()
-    return idx, result
+    return idx, si_result, page_data
 
 
 def process_pdf(pdf_bytes: bytes, customer_code: str) -> tuple[list[dict], bytes]:
@@ -472,26 +489,27 @@ def process_pdf(pdf_bytes: bytes, customer_code: str) -> tuple[list[dict], bytes
     page_count = doc.page_count
     doc.close()
 
-    # ── Pass 1: extract SI from all pages in parallel ─────────────────────────
-    # Cap workers at 4: each opens its own in-memory Document (~pdf_bytes RAM),
-    # and Tesseract is CPU-bound, so more than 4 yields diminishing returns.
+    # ── Pass 1: extract SI and build per-page PDF bytes in parallel ───────────
+    # Each worker opens its own Document copy (thread-safe), extracts the SI,
+    # and exports its page — combining what were previously two separate passes
+    # (parallel SI extraction + sequential ZIP building) into one parallel pass.
     raw: list[tuple[str, str]] = [("", "")] * page_count
-    workers = min(4, page_count)
+    page_data_list: list[bytes] = [b""] * page_count
+    workers = min(_MAX_WORKERS, page_count)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(_extract_si_worker, pdf_bytes, i): i for i in range(page_count)}
+        futs = {pool.submit(_extract_si_and_bytes_worker, pdf_bytes, i): i for i in range(page_count)}
         for fut in concurrent.futures.as_completed(futs):
-            idx, result = fut.result()
+            idx, result, page_data = fut.result()
             raw[idx] = result
+            page_data_list[idx] = page_data
 
     # ── Pass 2: fill fallback pages via consecutive-sequence inference ─────────
     raw = _infer_from_sequence(raw)
 
-    # ── Pass 3: build ZIP with final filenames ────────────────────────────────
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    # ── Pass 3: assemble ZIP from already-built page bytes ────────────────────
     results: list[dict] = []
     used: dict[str, int] = {}
     zip_buf = io.BytesIO()
-
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for i, (si, method) in enumerate(raw):
             base = si
@@ -500,17 +518,10 @@ def process_pdf(pdf_bytes: bytes, customer_code: str) -> tuple[list[dict], bytes
                 si = f"{base}_{used[base]}"
             else:
                 used[base] = 0
-
-            single = fitz.open()
-            single.insert_pdf(doc, from_page=i, to_page=i)
-            page_bytes_page = single.tobytes(deflate=True)
-            single.close()
-
             filename = f"SI_{customer_code}_{si}.pdf"
-            zf.writestr(filename, page_bytes_page)
+            zf.writestr(filename, page_data_list[i])
             results.append({"page": i + 1, "si": si, "filename": filename, "method": method})
 
-    doc.close()
     zip_buf.seek(0)
     return results, zip_buf.read()
 
@@ -657,13 +668,7 @@ def _save_result(results: list[dict], zip_bytes: bytes,
                  original_filename: str = "upload") -> str:
     token = secrets.token_urlsafe(24)
 
-    # Upload ZIP to GCS so any Cloud Run instance can serve the download.
     zip_blob_name = f"results/{token}.zip"
-    _storage().bucket(UPLOAD_BUCKET).blob(zip_blob_name).upload_from_string(
-        zip_bytes, content_type="application/zip"
-    )
-
-    # Derive the download filename: strip extension, sanitize, append suffix.
     stem = re.sub(r'[\\/*?:"<>|\r\n\t]', '_', Path(original_filename).stem).strip().strip('._') or "invoices"
     download_name = f"{stem}_invoices.zip"
 
@@ -676,13 +681,17 @@ def _save_result(results: list[dict], zip_bytes: bytes,
     }
     meta_json = json.dumps(meta)
 
-    # Upload JSON sidecar to GCS so every Cloud Run instance can read it —
-    # local /tmp is ephemeral and not shared across instances.
-    _storage().bucket(UPLOAD_BUCKET).blob(f"results/{token}.json").upload_from_string(
-        meta_json, content_type="application/json"
-    )
-    # Also cache locally so the redirected /result request on the *same* instance
-    # skips the GCS round-trip.
+    # Upload ZIP and JSON sidecar to GCS in parallel — both are independent.
+    bucket = _storage().bucket(UPLOAD_BUCKET)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        zip_fut  = pool.submit(bucket.blob(zip_blob_name).upload_from_string,
+                               zip_bytes, "application/zip")
+        json_fut = pool.submit(bucket.blob(f"results/{token}.json").upload_from_string,
+                               meta_json, "application/json")
+        zip_fut.result()
+        json_fut.result()
+
+    # Cache locally so the /result redirect on the same instance skips GCS.
     (TMP_DIR / f"{token}.json").write_text(meta_json)
     return token
 
