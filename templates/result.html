@@ -8,7 +8,7 @@
     :root{ --navy:#0F4C81; --sand:#E2A867; --ink:#0b1220; --muted:#667085; --bg:#F7F9FC; --card:#FFFFFF; --border:#E5E7EB; --green:#0a7d1a; }
     *{box-sizing:border-box}
     body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
-    .wrap{max-width:820px;margin:48px auto;padding:0 20px}
+    .wrap{max-width:860px;margin:48px auto;padding:0 20px}
     h1{margin:0 0 4px;font-size:24px}
     .sub{color:var(--muted);margin:0 0 24px}
     .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:22px;box-shadow:0 6px 16px rgba(15,76,129,.08);margin-bottom:16px}
@@ -29,6 +29,7 @@
     .pill-seq   {background:#e8f0fe;color:#1a3a8f}
     .pill-corr  {background:#fff3e0;color:#7c4a00}
     .pill-fall  {background:#fde8e8;color:#7c1e1e}
+    .pill-manual{background:#f3e8ff;color:#5b21b6}
     .note{color:var(--muted);font-size:13px;margin-top:4px}
     .stat{display:flex;gap:24px;flex-wrap:wrap;margin-bottom:20px}
     .stat-item{text-align:center}
@@ -37,6 +38,36 @@
     .compress-bar-wrap{background:#e5e7eb;border-radius:999px;height:10px;overflow:hidden;margin:6px 0 2px}
     .compress-bar{height:100%;border-radius:999px;background:linear-gradient(90deg,#0F4C81,#3b82f6);transition:width .6s ease}
     .compress-saved{color:var(--green);font-weight:600}
+
+    /* ── row actions ── */
+    .row-actions{display:flex;gap:4px;align-items:center;justify-content:flex-end;opacity:0;transition:opacity .15s}
+    tr:hover .row-actions{opacity:1}
+    .icon-btn{background:none;border:1px solid var(--border);border-radius:6px;padding:3px 8px;cursor:pointer;color:var(--muted);font-size:13px;line-height:1.4;transition:background .12s,color .12s;white-space:nowrap}
+    .icon-btn:hover{background:#e8f0fe;color:var(--navy);border-color:#c5d6f5}
+    .icon-btn:disabled{opacity:.45;cursor:not-allowed}
+
+    /* ── inline filename edit ── */
+    .fn-display{display:inline}
+    .fn-display.hidden{display:none}
+    .fn-edit{display:none;align-items:center;gap:4px;flex-wrap:wrap}
+    .fn-edit.active{display:flex}
+    .si-prefix{background:#f0f4f9;padding:2px 5px;border-radius:4px 0 0 4px;font-size:13px;font-family:monospace;border:1px solid var(--border);border-right:none;color:var(--muted)}
+    .si-input{border:1px solid var(--navy);border-radius:0 4px 4px 0;padding:2px 7px;font-size:13px;font-family:monospace;width:100px;outline:none}
+    .si-input:focus{box-shadow:0 0 0 2px rgba(15,76,129,.2)}
+    .si-suffix{background:#f0f4f9;padding:2px 5px;border-radius:4px;font-size:13px;font-family:monospace;border:1px solid var(--border);color:var(--muted)}
+    .save-btn{background:var(--navy);color:#fff;border:none;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:13px}
+    .save-btn:hover{filter:brightness(1.1)}
+    .cancel-btn{background:#fff;color:var(--muted);border:1px solid var(--border);border-radius:6px;padding:3px 8px;cursor:pointer;font-size:13px}
+    .cancel-btn:hover{background:#f0f4f9;color:var(--ink)}
+
+    /* ── inline error/status ── */
+    .row-msg{font-size:12px;margin-top:3px;display:none}
+    .row-msg.err{color:#b00020;display:block}
+    .row-msg.ok{color:var(--green);display:block}
+
+    /* ── spinner ── */
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .spin{display:inline-block;animation:spin .7s linear infinite}
   </style>
 </head>
 <body>
@@ -76,7 +107,7 @@
 
   <!-- Action buttons -->
   <div class="actions">
-    <a class="btn" href="/download/{{ token }}">
+    <a class="btn" id="dl-btn" href="/download/{{ token }}">
       <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
         <path d="M12 15V3m0 12-4-4m4 4 4-4M2 17l.621 2.485A2 2 0 0 0 4.561 21h14.878a2 2 0 0 0 1.94-1.515L22 17"/>
       </svg>
@@ -90,17 +121,31 @@
     <table>
       <thead>
         <tr>
-          <th style="width:60px">Page</th>
+          <th style="width:56px">Page</th>
           <th>Output filename</th>
           <th style="width:110px">Method</th>
+          <th style="width:110px"></th>
         </tr>
       </thead>
       <tbody>
         {% for r in results %}
-        <tr>
+        {% set cc = r.get('customer_code', '') %}
+        <tr data-idx="{{ loop.index0 }}" data-cc="{{ cc }}">
           <td>{{ r.page }}</td>
-          <td><code>{{ r.filename }}</code></td>
-          <td>
+
+          <!-- filename cell with inline edit -->
+          <td class="filename-cell">
+            <span class="fn-display"><code>{{ r.filename }}</code></span>
+            <div class="fn-edit">
+              <span class="si-prefix">SI_{{ cc }}_</span><input class="si-input" type="text" value="{{ r.si }}" size="12"><span class="si-suffix">.pdf</span>
+              <button class="save-btn">✓ Save</button>
+              <button class="cancel-btn">✕</button>
+            </div>
+            <div class="row-msg"></div>
+          </td>
+
+          <!-- method pill -->
+          <td class="method-cell">
             {% if r.method in ['text-crop','text-bottom','text-right','text-full'] %}
               <span class="pill pill-text">{{ r.method }}</span>
             {% elif r.method in ['ocr-crop','ocr-bottom','ocr-right','ocr-full'] %}
@@ -109,11 +154,23 @@
               <span class="pill pill-seq">sequence</span>
             {% elif r.method == 'corrected' %}
               <span class="pill pill-corr">corrected</span>
+            {% elif r.method == 'manual' %}
+              <span class="pill pill-manual">manual</span>
             {% elif r.method == 'fallback' %}
               <span class="pill pill-fall">fallback</span>
             {% else %}
               <span class="pill pill-fall">{{ r.method }}</span>
             {% endif %}
+          </td>
+
+          <!-- row actions (visible on hover) -->
+          <td>
+            <div class="row-actions">
+              <button class="icon-btn edit-btn" title="Edit SI number">✎ Edit</button>
+              {% if r.method != 'ocr-crop' %}
+              <button class="icon-btn reval-btn" title="Re-evaluate using OCR">↺ OCR</button>
+              {% endif %}
+            </div>
           </td>
         </tr>
         {% endfor %}
@@ -121,7 +178,169 @@
     </table>
   </div>
 
-  <div class="note">Files are available for download for 1 hour.</div>
+  <div class="note">Files are available for download for 1 hour. Edits apply to the stored ZIP immediately.</div>
 </div>
+
+<script>
+const TOKEN = {{ token | tojson }};
+
+/* ── pill HTML helper ── */
+const PILL_CLASS = {
+  'text-crop':'pill-text','text-bottom':'pill-text','text-right':'pill-text','text-full':'pill-text',
+  'ocr-crop':'pill-ocr','ocr-bottom':'pill-ocr','ocr-right':'pill-ocr','ocr-full':'pill-ocr',
+  'sequence':'pill-seq','corrected':'pill-corr','fallback':'pill-fall','manual':'pill-manual',
+};
+function pillHtml(method) {
+  const cls = PILL_CLASS[method] || 'pill-fall';
+  return `<span class="pill ${cls}">${method}</span>`;
+}
+
+/* ── shared helpers ── */
+function showMsg(row, text, type) {
+  const el = row.querySelector('.row-msg');
+  el.textContent = text;
+  el.className = `row-msg ${type}`;
+  if (type === 'ok') setTimeout(() => { el.className = 'row-msg'; }, 3000);
+}
+
+function setEditing(row, on) {
+  row.querySelector('.fn-display').classList.toggle('hidden', on);
+  row.querySelector('.fn-edit').classList.toggle('active', on);
+  if (on) {
+    const inp = row.querySelector('.si-input');
+    inp.focus();
+    inp.select();
+  }
+}
+
+/* ── edit button ── */
+document.querySelectorAll('.edit-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const row = btn.closest('tr');
+    setEditing(row, true);
+  });
+});
+
+/* ── cancel ── */
+document.querySelectorAll('.cancel-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const row = btn.closest('tr');
+    // restore original value
+    const currentFilename = row.querySelector('.fn-display code').textContent;
+    // extract SI from filename: SI_{cc}_{si}.pdf → take after last underscore before .pdf
+    const m = currentFilename.match(/^SI_[^_]+_(.+)\.pdf$/);
+    if (m) row.querySelector('.si-input').value = m[1];
+    setEditing(row, false);
+    row.querySelector('.row-msg').className = 'row-msg';
+  });
+});
+
+/* ── save (rename) ── */
+document.querySelectorAll('.save-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const row    = btn.closest('tr');
+    const pageIdx = parseInt(row.dataset.idx);
+    const newSi   = row.querySelector('.si-input').value.trim();
+    if (!newSi) return;
+
+    btn.disabled = true;
+    btn.textContent = '…';
+
+    try {
+      const resp = await fetch('/rename-page', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({token: TOKEN, page_index: pageIdx, new_si: newSi}),
+      });
+      const data = await resp.json();
+
+      if (data.ok) {
+        row.querySelector('.fn-display code').textContent = data.filename;
+        row.querySelector('.method-cell').innerHTML = pillHtml(data.method);
+        // if method changed away from ocr-crop, re-evaluate button might need adding;
+        // simpler: just show it for any non-ocr-crop method after rename
+        const actionsDiv = row.querySelector('.row-actions');
+        if (!actionsDiv.querySelector('.reval-btn') && data.method !== 'ocr-crop') {
+          const rb = document.createElement('button');
+          rb.className = 'icon-btn reval-btn';
+          rb.title = 'Re-evaluate using OCR';
+          rb.textContent = '↺ OCR';
+          actionsDiv.appendChild(rb);
+          wireReval(rb);
+        }
+        setEditing(row, false);
+        showMsg(row, 'Saved', 'ok');
+      } else {
+        showMsg(row, data.error || 'Rename failed', 'err');
+      }
+    } catch (e) {
+      showMsg(row, 'Network error', 'err');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '✓ Save';
+    }
+  });
+});
+
+/* ── Enter key in SI input ── */
+document.querySelectorAll('.si-input').forEach(inp => {
+  inp.addEventListener('keydown', e => {
+    if (e.key === 'Enter') inp.closest('tr').querySelector('.save-btn').click();
+    if (e.key === 'Escape') inp.closest('tr').querySelector('.cancel-btn').click();
+  });
+});
+
+/* ── re-evaluate ── */
+function wireReval(btn) {
+  btn.addEventListener('click', async () => {
+    const row     = btn.closest('tr');
+    const pageIdx = parseInt(row.dataset.idx);
+
+    btn.disabled = true;
+    const orig = btn.textContent;
+    btn.innerHTML = '<span class="spin">↺</span> OCR';
+
+    try {
+      const resp = await fetch('/re-evaluate', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({token: TOKEN, page_index: pageIdx}),
+      });
+      const data = await resp.json();
+
+      if (!data.ok) {
+        showMsg(row, data.message || 'Re-evaluation failed', 'err');
+        btn.disabled = false;
+        btn.textContent = orig;
+        return;
+      }
+
+      if (data.changed) {
+        row.querySelector('.fn-display code').textContent = data.filename;
+        // update si-input value in case user opens edit later
+        row.querySelector('.si-input').value = data.si;
+        row.querySelector('.method-cell').innerHTML = pillHtml(data.method);
+        showMsg(row, `Updated → ${data.filename}`, 'ok');
+      } else {
+        showMsg(row, 'No change — OCR agrees with current value', 'ok');
+      }
+
+      // hide re-evaluate button if result is now ocr-crop
+      if (data.method === 'ocr-crop') {
+        btn.remove();
+      } else {
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
+    } catch (e) {
+      showMsg(row, 'Network error', 'err');
+      btn.disabled = false;
+      btn.textContent = orig;
+    }
+  });
+}
+
+document.querySelectorAll('.reval-btn').forEach(wireReval);
+</script>
 </body>
 </html>

@@ -510,7 +510,8 @@ def process_pdf(pdf_bytes: bytes, customer_code: str) -> tuple[list[dict], bytes
                 used[base] = 0
             filename = f"SI_{customer_code}_{si}.pdf"
             zf.writestr(filename, page_bytes_list[i])
-            results.append({"page": i + 1, "si": si, "filename": filename, "method": method})
+            results.append({"page": i + 1, "si": si, "filename": filename, "method": method,
+                            "customer_code": customer_code})
 
     zip_buf.seek(0)
     return results, zip_buf.read()
@@ -711,6 +712,39 @@ def _load_result_meta(token: str) -> dict | None:
         return None
 
 
+def _rebuild_zip_renamed(zip_bytes: bytes, old_name: str, new_name: str) -> bytes:
+    """Return a new ZIP identical to *zip_bytes* except one entry is renamed."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as src:
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as dst:
+            for name in src.namelist():
+                dst.writestr(new_name if name == old_name else name, src.read(name))
+    return buf.getvalue()
+
+
+def _update_result_entry(token: str, page_idx: int, new_si: str, new_method: str,
+                         zip_bytes: bytes, meta: dict) -> None:
+    """Rename one page entry in both the ZIP and the metadata JSON, then re-upload both."""
+    entry        = meta["results"][page_idx]
+    old_filename = entry["filename"]
+    cc           = entry.get("customer_code", "UNKNOWN")
+    new_filename = f"SI_{cc}_{new_si}.pdf"
+
+    new_zip = _rebuild_zip_renamed(zip_bytes, old_filename, new_filename)
+    entry.update({"si": new_si, "filename": new_filename, "method": new_method})
+    meta_json = json.dumps(meta)
+
+    bucket = _storage().bucket(UPLOAD_BUCKET)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(bucket.blob(meta["zip_blob"]).upload_from_string,
+                         new_zip, "application/zip")
+        f2 = pool.submit(bucket.blob(f"results/{token}.json").upload_from_string,
+                         meta_json, "application/json")
+        f1.result(); f2.result()
+
+    (TMP_DIR / f"{token}.json").write_text(meta_json)
+
+
 # ── Flask app ──────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
@@ -856,6 +890,152 @@ def download(token: str):
         return jsonify({"error": f"Could not generate download URL: {exc}"}), 500
 
     return redirect(signed_url, code=302)
+
+
+# ── Per-page re-evaluate & rename ────────────────────────────────────────────
+
+def _validate_token_and_page(token: str, page_idx) -> tuple[dict, int] | tuple[None, None]:
+    """Return (meta, page_idx) or (None, None) on any validation failure."""
+    if not re.fullmatch(r'[A-Za-z0-9_\-]{24,40}', token):
+        return None, None
+    meta = _load_result_meta(token)
+    if not meta:
+        return None, None
+    try:
+        page_idx = int(page_idx)
+    except (TypeError, ValueError):
+        return None, None
+    if page_idx < 0 or page_idx >= len(meta["results"]):
+        return None, None
+    return meta, page_idx
+
+
+@app.post("/re-evaluate")
+def re_evaluate():
+    """Force OCR re-extraction for one page and rename it in the ZIP if the SI changes."""
+    data     = request.get_json(silent=True) or {}
+    token    = str(data.get("token", "")).strip()
+    page_idx = data.get("page_index")
+
+    if not token or page_idx is None:
+        return jsonify({"error": "token and page_index are required"}), 400
+
+    meta, page_idx = _validate_token_and_page(token, page_idx)
+    if meta is None:
+        return jsonify({"error": "Invalid token or page_index"}), 400
+
+    entry        = meta["results"][page_idx]
+    old_filename = entry["filename"]
+    cc           = entry.get("customer_code", "UNKNOWN")
+
+    # Pull the single-page PDF from the existing ZIP — no need to re-download the
+    # original upload; the ZIP already contains stand-alone page PDFs.
+    try:
+        zip_bytes = _storage().bucket(UPLOAD_BUCKET).blob(
+            meta["zip_blob"]).download_as_bytes()
+    except Exception as exc:
+        return jsonify({"error": f"Failed to download result: {exc}"}), 500
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+            page_pdf_bytes = zf.read(old_filename)
+    except Exception as exc:
+        return jsonify({"error": f"Could not extract page: {exc}"}), 500
+
+    doc  = fitz.open(stream=page_pdf_bytes, filetype="pdf")
+    page = doc[0]
+    h, w = page.rect.height, page.rect.width
+
+    new_si, new_method = None, None
+
+    crop = _load_crop_region()
+    if crop and _TESS_OK:
+        clip_r = fitz.Rect(w * crop["x1"], h * crop["y1"], w * crop["x2"], h * crop["y2"])
+        new_si = _find_si(_ocr_text(page, clip_r, psm=6))
+        if new_si:
+            new_method = "ocr-crop"
+
+    if new_si is None and _TESS_OK:
+        new_si = _find_si(_ocr_text(page, fitz.Rect(0, h * 0.60, w, h)))
+        if new_si:
+            new_method = "ocr-bottom"
+
+    if new_si is None and _TESS_OK:
+        new_si = _find_si(_ocr_text(page, fitz.Rect(w * 0.50, 0, w, h)))
+        if new_si:
+            new_method = "ocr-right"
+
+    if new_si is None and _TESS_OK:
+        new_si = _find_si(_ocr_text(page))
+        if new_si:
+            new_method = "ocr-full"
+
+    doc.close()
+
+    if new_si is None:
+        return jsonify({"ok": False, "message": "No SI number found via OCR"})
+
+    new_si       = _sanitize(new_si)
+    new_filename = f"SI_{cc}_{new_si}.pdf"
+
+    # Check for SI conflict with another page.
+    for i, r in enumerate(meta["results"]):
+        if i != page_idx and r["filename"] == new_filename:
+            return jsonify({"ok": False,
+                            "message": f"SI {new_si} already used by page {r['page']}"})
+
+    changed = new_filename != old_filename or new_method != entry["method"]
+    if changed:
+        _update_result_entry(token, page_idx, new_si, new_method, zip_bytes, meta)
+    else:
+        # Method unchanged and filename unchanged — nothing to rewrite.
+        pass
+
+    return jsonify({"ok": True, "changed": changed, "si": new_si,
+                    "filename": new_filename, "method": new_method})
+
+
+@app.post("/rename-page")
+def rename_page():
+    """Manually rename one page's SI number, rebuilding the ZIP entry."""
+    data     = request.get_json(silent=True) or {}
+    token    = str(data.get("token", "")).strip()
+    page_idx = data.get("page_index")
+    new_si   = str(data.get("new_si", "")).strip()
+
+    if not token or page_idx is None or not new_si:
+        return jsonify({"error": "token, page_index, and new_si are required"}), 400
+
+    meta, page_idx = _validate_token_and_page(token, page_idx)
+    if meta is None:
+        return jsonify({"error": "Invalid token or page_index"}), 400
+
+    new_si = _sanitize(new_si)
+    if not new_si:
+        return jsonify({"error": "Invalid SI number"}), 400
+
+    entry        = meta["results"][page_idx]
+    old_filename = entry["filename"]
+    cc           = entry.get("customer_code", "UNKNOWN")
+    new_filename = f"SI_{cc}_{new_si}.pdf"
+
+    # Reject if another page already uses this filename.
+    for i, r in enumerate(meta["results"]):
+        if i != page_idx and r["filename"] == new_filename:
+            return jsonify({"error": f"'{new_filename}' already used by page {r['page']}"}), 409
+
+    if new_filename == old_filename:
+        return jsonify({"ok": True, "si": entry["si"], "filename": old_filename,
+                        "method": entry["method"]})
+
+    try:
+        zip_bytes = _storage().bucket(UPLOAD_BUCKET).blob(
+            meta["zip_blob"]).download_as_bytes()
+    except Exception as exc:
+        return jsonify({"error": f"Failed to download result: {exc}"}), 500
+
+    _update_result_entry(token, page_idx, new_si, "manual", zip_bytes, meta)
+    return jsonify({"ok": True, "si": new_si, "filename": new_filename, "method": "manual"})
 
 
 # ── Crop-region setup ─────────────────────────────────────────────────────────
