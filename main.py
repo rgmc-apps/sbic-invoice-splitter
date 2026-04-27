@@ -89,6 +89,7 @@ def _load_crop_region() -> dict | None:
 _PREMADE_CODES: dict[str, str] = {
     "MTC":  "240762",
     "SBIC": "190275",
+    "SVI":  "190275"
 }
 
 _codes_cache: dict[str, str] | None = None
@@ -218,33 +219,6 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
-def _page_text(doc: fitz.Document, idx: int, clip: fitz.Rect | None = None) -> str:
-    """Extract text from a page or a clipped region.
-
-    For clip regions, PyMuPDF's native get_text() is used directly — it is an
-    order of magnitude faster than pymupdf4llm for tight rectangular regions
-    and avoids the full layout-analysis pass that to_markdown() performs.
-
-    For full-page extraction (clip=None), pymupdf4llm is tried first because
-    its table-aware layout pass can reconstruct reading order that get_text()
-    misses on structured invoice layouts.
-    """
-    page = doc[idx]
-    if clip is not None:
-        return page.get_text("text", clip=clip)
-
-    # Full-page: try pymupdf4llm for better layout/table awareness.
-    if _ML4LLM_OK:
-        try:
-            md = _pymupdf4llm.to_markdown(doc, pages=[idx])
-            stripped = _strip_markdown(md)
-            if stripped:
-                return stripped
-        except Exception:
-            pass
-    return page.get_text("text")
-
-
 def _ocr_text(page: fitz.Page, clip: fitz.Rect | None = None, psm: int = 11) -> str:
     """Render a page region to pixels and run Tesseract OCR on it.
 
@@ -300,67 +274,6 @@ def _ocr_text(page: fitz.Page, clip: fitz.Rect | None = None, psm: int = 11) -> 
         return _ocr_clean(raw)
     except Exception:
         return ""
-
-
-def _extract_si(doc: fitz.Document, idx: int) -> tuple[str, str]:
-    page = doc[idx]
-    h, w = page.rect.height, page.rect.width
-
-    # ── Priority 1: user-configured crop region (OCR first, then text layer) ──
-    crop = _load_crop_region()
-    if crop:
-        clip = fitz.Rect(w * crop["x1"], h * crop["y1"], w * crop["x2"], h * crop["y2"])
-        if _TESS_OK:
-            # psm=6: treat the small crop zone as a single uniform text block —
-            # more accurate than psm=11 (sparse) on a tight, well-defined region.
-            si = _find_si(_ocr_text(page, clip, psm=6))
-            if si:
-                return si, "ocr-crop"
-        si = _find_si(_page_text(doc, idx, clip))
-        if si:
-            return si, "text-crop"
-
-    # ── Priority 2: bottom 40 % of page ───────────────────────────────────────
-    si = _find_si(_page_text(doc, idx, fitz.Rect(0, h * 0.60, w, h)))
-    if si:
-        return si, "text-bottom"
-    if _TESS_OK:
-        si = _find_si(_ocr_text(page, fitz.Rect(0, h * 0.60, w, h)))
-        if si:
-            return si, "ocr-bottom"
-
-    # ── Priority 3: right half of page ────────────────────────────────────────
-    si = _find_si(_page_text(doc, idx, fitz.Rect(w * 0.50, 0, w, h)))
-    if si:
-        return si, "text-right"
-    if _TESS_OK:
-        si = _find_si(_ocr_text(page, fitz.Rect(w * 0.50, 0, w, h)))
-        if si:
-            return si, "ocr-right"
-
-    # ── Priority 4: full page ─────────────────────────────────────────────────
-    # Fast path: native get_text() skips pymupdf4llm's layout analysis pass.
-    # Only invoke the expensive table-aware pass when the fast path misses.
-    fast_text = page.get_text("text")
-    si = _find_si(fast_text)
-    if si:
-        return si, "text-full"
-    if _ML4LLM_OK:
-        try:
-            md = _pymupdf4llm.to_markdown(doc, pages=[idx])
-            stripped = _strip_markdown(md)
-            si = _find_si(stripped)
-            if si:
-                return si, "text-full"
-        except Exception:
-            pass
-    if _TESS_OK:
-        si = _find_si(_ocr_text(page))
-        if si:
-            return si, "ocr-full"
-
-    # No SI found by any method — use fallback page name.
-    return f"page_{idx + 1:04d}", "fallback"
 
 
 def _infer_from_sequence(raw: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -465,50 +378,127 @@ def _optimize_pdf(pdf_bytes: bytes) -> bytes:
     return optimized if len(optimized) < len(pdf_bytes) else pdf_bytes
 
 
-def _extract_si_and_bytes_worker(pdf_bytes: bytes, idx: int) -> tuple[int, tuple[str, str], bytes]:
-    """Open an independent Document, extract the SI, and export the page as bytes.
-
-    Combining both operations in a single document open eliminates the separate
-    sequential ZIP-building pass that previously re-opened the full PDF for every page.
-    """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    try:
-        si_result = _extract_si(doc, idx)
-        single = fitz.open()
-        single.insert_pdf(doc, from_page=idx, to_page=idx)
-        page_data = single.tobytes(deflate=True)
-        single.close()
-    finally:
-        doc.close()
-    return idx, si_result, page_data
-
-
 def process_pdf(pdf_bytes: bytes, customer_code: str) -> tuple[list[dict], bytes]:
     """Split every page into its own PDF named SI_{customer_code}_{si_number}.pdf."""
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page_count = doc.page_count
+
+    # ── Phase 1: single-pass pre-extraction (one full-PDF open) ───────────────
+    # Opens the full document exactly once to pre-extract per-page bytes and
+    # all native text clips. Workers in Phase 2 then open only tiny 1-page PDFs
+    # (or skip PDF opens entirely when text methods succeed), eliminating the
+    # N × full-PDF-parse overhead that was the primary bottleneck for large files.
+    doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
+    n    = doc.page_count
+    crop = _load_crop_region()
+
+    page_bytes_list: list[bytes]               = []
+    page_dims:       list[tuple[float, float]] = []
+    page_fast_text:  list[str]                 = []
+    page_bot_text:   list[str]                 = []
+    page_right_text: list[str]                 = []
+    page_crop_text:  list[str]                 = []
+
+    for i in range(n):
+        pg = doc[i]
+        h, w = pg.rect.height, pg.rect.width
+        page_dims.append((h, w))
+        page_fast_text.append(pg.get_text("text"))
+        page_bot_text.append(pg.get_text("text", clip=fitz.Rect(0, h * 0.60, w, h)))
+        page_right_text.append(pg.get_text("text", clip=fitz.Rect(w * 0.50, 0, w, h)))
+        page_crop_text.append(
+            pg.get_text("text", clip=fitz.Rect(
+                w * crop["x1"], h * crop["y1"], w * crop["x2"], h * crop["y2"]
+            )) if crop else ""
+        )
+        single = fitz.open()
+        single.insert_pdf(doc, from_page=i, to_page=i)
+        page_bytes_list.append(single.tobytes(deflate=True))
+        single.close()
+
     doc.close()
 
-    # ── Pass 1: extract SI and build per-page PDF bytes in parallel ───────────
-    # Each worker opens its own Document copy (thread-safe), extracts the SI,
-    # and exports its page — combining what were previously two separate passes
-    # (parallel SI extraction + sequential ZIP building) into one parallel pass.
-    raw: list[tuple[str, str]] = [("", "")] * page_count
-    page_data_list: list[bytes] = [b""] * page_count
-    workers = min(_MAX_WORKERS, page_count)
+    # ── Phase 2: parallel SI extraction using pre-extracted data ──────────────
+    # Text methods use pre-extracted strings — zero PDF opens.
+    # OCR and pymupdf4llm open a single-page PDF (much cheaper than the full doc).
+    # All OCR fallbacks share one single-page PDF open per worker invocation.
+    raw: list[tuple[str, str]] = [("", "")] * n
+
+    def _worker(i: int) -> tuple[int, tuple[str, str]]:
+        h, w = page_dims[i]
+
+        # Priority 1: crop region — OCR first because custom glyph-to-Unicode
+        # mappings in these invoices corrupt the text layer; OCR bypasses that.
+        if crop:
+            if _TESS_OK:
+                d = fitz.open(stream=page_bytes_list[i], filetype="pdf")
+                try:
+                    clip_r = fitz.Rect(w * crop["x1"], h * crop["y1"], w * crop["x2"], h * crop["y2"])
+                    si = _find_si(_ocr_text(d[0], clip_r, psm=6))
+                finally:
+                    d.close()
+                if si:
+                    return i, (si, "ocr-crop")
+            si = _find_si(page_crop_text[i])
+            if si:
+                return i, (si, "text-crop")
+
+        # Priorities 2–4a: native text (pre-extracted, no PDF open needed)
+        si = _find_si(page_bot_text[i])
+        if si:
+            return i, (si, "text-bottom")
+
+        si = _find_si(page_right_text[i])
+        if si:
+            return i, (si, "text-right")
+
+        si = _find_si(page_fast_text[i])
+        if si:
+            return i, (si, "text-full")
+
+        # Priority 4b: pymupdf4llm layout pass (single-page open)
+        if _ML4LLM_OK:
+            d = fitz.open(stream=page_bytes_list[i], filetype="pdf")
+            try:
+                md = _pymupdf4llm.to_markdown(d, pages=[0])
+                si = _find_si(_strip_markdown(md))
+            except Exception:
+                si = None
+            finally:
+                d.close()
+            if si:
+                return i, (si, "text-full")
+
+        # Priority 4c–6: OCR — open single-page PDF once for all OCR attempts
+        if _TESS_OK:
+            d = fitz.open(stream=page_bytes_list[i], filetype="pdf")
+            try:
+                p = d[0]
+                si = _find_si(_ocr_text(p, fitz.Rect(0, h * 0.60, w, h)))
+                if si:
+                    return i, (si, "ocr-bottom")
+                si = _find_si(_ocr_text(p, fitz.Rect(w * 0.50, 0, w, h)))
+                if si:
+                    return i, (si, "ocr-right")
+                si = _find_si(_ocr_text(p))
+                if si:
+                    return i, (si, "ocr-full")
+            finally:
+                d.close()
+
+        return i, (f"page_{i + 1:04d}", "fallback")
+
+    workers = min(_MAX_WORKERS, n)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(_extract_si_and_bytes_worker, pdf_bytes, i): i for i in range(page_count)}
+        futs = {pool.submit(_worker, i): i for i in range(n)}
         for fut in concurrent.futures.as_completed(futs):
-            idx, result, page_data = fut.result()
+            idx, result = fut.result()
             raw[idx] = result
-            page_data_list[idx] = page_data
 
     # ── Pass 2: fill fallback pages via consecutive-sequence inference ─────────
     raw = _infer_from_sequence(raw)
 
     # ── Pass 3: assemble ZIP from already-built page bytes ────────────────────
     results: list[dict] = []
-    used: dict[str, int] = {}
+    used:    dict[str, int] = {}
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for i, (si, method) in enumerate(raw):
@@ -519,7 +509,7 @@ def process_pdf(pdf_bytes: bytes, customer_code: str) -> tuple[list[dict], bytes
             else:
                 used[base] = 0
             filename = f"SI_{customer_code}_{si}.pdf"
-            zf.writestr(filename, page_data_list[i])
+            zf.writestr(filename, page_bytes_list[i])
             results.append({"page": i + 1, "si": si, "filename": filename, "method": method})
 
     zip_buf.seek(0)
