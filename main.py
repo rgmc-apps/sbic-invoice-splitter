@@ -177,6 +177,8 @@ def _sanitize(name: str) -> str:
 
 
 def _find_si(text: str) -> str | None:
+    if not text:
+        return None
     # Collapse newlines so label/value pairs split across lines still match
     # (e.g. "SI No:\n123456" → "SI No: 123456").
     normalized = re.sub(r'[ \t]*[\r\n]+[ \t]*', ' ', text).strip()
@@ -232,7 +234,7 @@ _OCR_FULL_ATTEMPTS: list[tuple[int, int, int]] = [
 
 def _ocr_text(page: fitz.Page, clip: fitz.Rect | None = None, psm: int = 11,
               zoom: int | None = None, bin_threshold: int = 140,
-              _cached_pix=None) -> str:
+              _cached_pix=None, _cached_img=None) -> str:
     """Render a page region to pixels and run Tesseract OCR on it.
 
     Bypasses the PDF font-encoding layer entirely — the only reliable approach
@@ -245,7 +247,9 @@ def _ocr_text(page: fitz.Page, clip: fitz.Rect | None = None, psm: int = 11,
 
     zoom overrides the default (4× for clip regions, 3× for full-page).
     bin_threshold controls binarization: pixels above it become white (background).
-    _cached_pix accepts a pre-rendered fitz.Pixmap to skip the render step entirely.
+    _cached_pix accepts a pre-rendered fitz.Pixmap to skip the render step.
+    _cached_img accepts a post-contrast PIL image to skip render + PIL processing;
+      only binarization is re-applied (useful when retrying with a different threshold).
 
     Image pipeline (applied before Tesseract):
       1. 4× zoom for clip regions, 3× for full-page — more pixels let Tesseract
@@ -261,23 +265,26 @@ def _ocr_text(page: fitz.Page, clip: fitz.Rect | None = None, psm: int = 11,
     if not _TESS_OK:
         return ""
     try:
-        effective_zoom = zoom if zoom is not None else (4 if clip is not None else 3)
-        if _cached_pix is not None:
-            pix = _cached_pix
+        if _cached_img is not None:
+            # Reuse pre-processed PIL image; only redo binarization for this threshold.
+            img = _cached_img
         else:
-            # Higher zoom for focused clip regions — descenders ("9") and ascenders
-            # ("6") become clearly distinct at 4× vs ambiguous at 3×.
-            mat = fitz.Matrix(effective_zoom, effective_zoom)
-            px_kwargs: dict = {"matrix": mat, "colorspace": fitz.csGRAY}
-            if clip is not None:
-                px_kwargs["clip"] = clip
-            pix = page.get_pixmap(**px_kwargs)
-        img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
-
-        # Unsharp mask: radius=2 sharpens thin digit strokes without
-        # over-amplifying noise; percent=150 is a moderate gain.
-        img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
-        img = ImageEnhance.Contrast(img).enhance(2.0)
+            effective_zoom = zoom if zoom is not None else (4 if clip is not None else 3)
+            if _cached_pix is not None:
+                pix = _cached_pix
+            else:
+                # Higher zoom for focused clip regions — descenders ("9") and ascenders
+                # ("6") become clearly distinct at 4× vs ambiguous at 3×.
+                mat = fitz.Matrix(effective_zoom, effective_zoom)
+                px_kwargs: dict = {"matrix": mat, "colorspace": fitz.csGRAY}
+                if clip is not None:
+                    px_kwargs["clip"] = clip
+                pix = page.get_pixmap(**px_kwargs)
+            img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+            # Unsharp mask: radius=2 sharpens thin digit strokes without
+            # over-amplifying noise; percent=150 is a moderate gain.
+            img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+            img = ImageEnhance.Contrast(img).enhance(2.0)
 
         # Binarize at bin_threshold: pixels above → white (background), below → black (ink).
         # Default 140 (slightly above 128) handles light-gray invoice backgrounds
@@ -399,15 +406,21 @@ def _optimize_pdf(pdf_bytes: bytes) -> bytes:
     return optimized if len(optimized) < len(pdf_bytes) else pdf_bytes
 
 
-def process_pdf(pdf_bytes: bytes, customer_code: str) -> tuple[list[dict], bytes]:
-    """Split every page into its own PDF named SI_{customer_code}_{si_number}.pdf."""
+def process_pdf(pdf_bytes: bytes, customer_code: str,
+                _doc: fitz.Document | None = None) -> tuple[list[dict], bytes]:
+    """Split every page into its own PDF named SI_{customer_code}_{si_number}.pdf.
+
+    _doc — optional pre-opened fitz.Document; caller is responsible for closing it.
+    When omitted the document is opened and closed internally.
+    """
 
     # ── Phase 1: single-pass pre-extraction (one full-PDF open) ───────────────
     # Opens the full document exactly once to pre-extract per-page bytes and
     # all native text clips. Workers in Phase 2 then open only tiny 1-page PDFs
     # (or skip PDF opens entirely when text methods succeed), eliminating the
     # N × full-PDF-parse overhead that was the primary bottleneck for large files.
-    doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
+    _owns_doc = _doc is None
+    doc  = fitz.open(stream=pdf_bytes, filetype="pdf") if _owns_doc else _doc
     n    = doc.page_count
     crop = _load_crop_region()
 
@@ -432,10 +445,13 @@ def process_pdf(pdf_bytes: bytes, customer_code: str) -> tuple[list[dict], bytes
         )
         single = fitz.open()
         single.insert_pdf(doc, from_page=i, to_page=i)
-        page_bytes_list.append(single.tobytes(deflate=True))
+        # deflate=False: page bytes are uncompressed so workers parse them faster.
+        # The ZIP uses ZIP_STORED, so there is no double-compression either way.
+        page_bytes_list.append(single.tobytes(deflate=False))
         single.close()
 
-    doc.close()
+    if _owns_doc:
+        doc.close()
 
     # ── Phase 2: parallel SI extraction using pre-extracted data ──────────────
     # Text methods use pre-extracted strings — zero PDF opens.
@@ -458,13 +474,21 @@ def process_pdf(pdf_bytes: bytes, customer_code: str) -> tuple[list[dict], bytes
             # Pixmaps are cached per zoom level to avoid re-rendering identical bitmaps.
             if _TESS_OK:
                 _pix_cache: dict[int, object] = {}
+                _pil_cache: dict[int, object] = {}  # zoom → post-contrast PIL image
                 for psm, zm, thr in _OCR_FULL_ATTEMPTS:
                     if zm not in _pix_cache:
                         _pix_cache[zm] = p.get_pixmap(
                             matrix=fitz.Matrix(zm, zm), colorspace=fitz.csGRAY
                         )
+                    if zm not in _pil_cache:
+                        _px = _pix_cache[zm]
+                        _base = Image.frombytes("L", (_px.width, _px.height), _px.samples)
+                        _base = _base.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+                        _base = ImageEnhance.Contrast(_base).enhance(2.0)
+                        _pil_cache[zm] = _base
                     si = _find_si(_ocr_text(p, psm=psm, zoom=zm, bin_threshold=thr,
-                                            _cached_pix=_pix_cache[zm]))
+                                            _cached_pix=_pix_cache[zm],
+                                            _cached_img=_pil_cache[zm]))
                     if si:
                         return i, (si, "ocr-full")
 
@@ -602,7 +626,13 @@ def _process_job(job_id: str, blob_name: str, filename: str) -> None:
             return
 
         try:
-            results, zip_bytes = process_pdf(pdf_bytes, customer_code)
+            # Open the document once here; pass it to process_pdf so Phase 1
+            # reuses the already-parsed document instead of opening it again.
+            _pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            try:
+                results, zip_bytes = process_pdf(pdf_bytes, customer_code, _doc=_pdf_doc)
+            finally:
+                _pdf_doc.close()
         except MemoryError:
             _fail(
                 "Out of memory while splitting the PDF.", "oom_split",
