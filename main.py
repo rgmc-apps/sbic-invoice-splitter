@@ -219,7 +219,20 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
-def _ocr_text(page: fitz.Page, clip: fitz.Rect | None = None, psm: int = 11) -> str:
+# ocr-full retry schedule: (psm, zoom, bin_threshold)
+# Attempt 0 (primary)  : PSM 11 sparse-text, 3× zoom, threshold 140 — standard full-page
+# Retry 1              : PSM 6  uniform-block, 4× zoom, threshold 128 — higher-res, softer binarize
+# Retry 2              : PSM 3  auto-segment,  3× zoom, threshold 150 — alternative segmentation
+_OCR_FULL_ATTEMPTS: list[tuple[int, int, int]] = [
+    (11, 3, 140),
+    (6,  4, 128),
+    (3,  3, 150),
+]
+
+
+def _ocr_text(page: fitz.Page, clip: fitz.Rect | None = None, psm: int = 11,
+              zoom: int | None = None, bin_threshold: int = 140,
+              _cached_pix=None) -> str:
     """Render a page region to pixels and run Tesseract OCR on it.
 
     Bypasses the PDF font-encoding layer entirely — the only reliable approach
@@ -229,6 +242,10 @@ def _ocr_text(page: fitz.Page, clip: fitz.Rect | None = None, psm: int = 11) -> 
     psm controls Tesseract's page-segmentation mode:
       6 = single uniform text block (best for small crop regions)
      11 = sparse text, find as much as possible (best for large/full-page regions)
+
+    zoom overrides the default (4× for clip regions, 3× for full-page).
+    bin_threshold controls binarization: pixels above it become white (background).
+    _cached_pix accepts a pre-rendered fitz.Pixmap to skip the render step entirely.
 
     Image pipeline (applied before Tesseract):
       1. 4× zoom for clip regions, 3× for full-page — more pixels let Tesseract
@@ -244,14 +261,17 @@ def _ocr_text(page: fitz.Page, clip: fitz.Rect | None = None, psm: int = 11) -> 
     if not _TESS_OK:
         return ""
     try:
-        # Higher zoom for focused clip regions — descenders ("9") and ascenders
-        # ("6") become clearly distinct at 4× vs ambiguous at 3×.
-        zoom = 4 if clip is not None else 3
-        mat = fitz.Matrix(zoom, zoom)
-        px_kwargs: dict = {"matrix": mat, "colorspace": fitz.csGRAY}
-        if clip is not None:
-            px_kwargs["clip"] = clip
-        pix = page.get_pixmap(**px_kwargs)
+        effective_zoom = zoom if zoom is not None else (4 if clip is not None else 3)
+        if _cached_pix is not None:
+            pix = _cached_pix
+        else:
+            # Higher zoom for focused clip regions — descenders ("9") and ascenders
+            # ("6") become clearly distinct at 4× vs ambiguous at 3×.
+            mat = fitz.Matrix(effective_zoom, effective_zoom)
+            px_kwargs: dict = {"matrix": mat, "colorspace": fitz.csGRAY}
+            if clip is not None:
+                px_kwargs["clip"] = clip
+            pix = page.get_pixmap(**px_kwargs)
         img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
 
         # Unsharp mask: radius=2 sharpens thin digit strokes without
@@ -259,10 +279,11 @@ def _ocr_text(page: fitz.Page, clip: fitz.Rect | None = None, psm: int = 11) -> 
         img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
         img = ImageEnhance.Contrast(img).enhance(2.0)
 
-        # Binarize: pixels above 140 → white (background), below → black (ink).
-        # Threshold 140 (slightly above 128) handles light-gray invoice
-        # backgrounds without swallowing thin stroke tails on digits like "9".
-        img = img.point(lambda p: 255 if p > 140 else 0)
+        # Binarize at bin_threshold: pixels above → white (background), below → black (ink).
+        # Default 140 (slightly above 128) handles light-gray invoice backgrounds
+        # without swallowing thin stroke tails on digits like "9".
+        thr = bin_threshold
+        img = img.point(lambda p: 255 if p > thr else 0)
 
         # load_system_dawg=0 / load_freq_dawg=0: disable word-frequency and
         # dictionary lookups so Tesseract relies purely on character shape
@@ -425,66 +446,78 @@ def process_pdf(pdf_bytes: bytes, customer_code: str) -> tuple[list[dict], bytes
     def _worker(i: int) -> tuple[int, tuple[str, str]]:
         h, w = page_dims[i]
 
-        # Priority 1: crop region — OCR first because custom glyph-to-Unicode
-        # mappings in these invoices corrupt the text layer; OCR bypasses that.
-        if crop:
+        # Open the single-page PDF once; reused by all OCR priorities in this worker.
+        # Skipped entirely when Tesseract is unavailable.
+        ocr_doc = fitz.open(stream=page_bytes_list[i], filetype="pdf") if _TESS_OK else None
+        try:
+            p = ocr_doc[0] if ocr_doc is not None else None
+
+            # Priority 1: ocr-full — preferred result; 1 try + 2 retries with varied params.
+            # OCR is first because custom glyph-to-Unicode mappings in these invoices
+            # corrupt the native text layer; reading pixels bypasses that entirely.
+            # Pixmaps are cached per zoom level to avoid re-rendering identical bitmaps.
             if _TESS_OK:
-                d = fitz.open(stream=page_bytes_list[i], filetype="pdf")
-                try:
+                _pix_cache: dict[int, object] = {}
+                for psm, zm, thr in _OCR_FULL_ATTEMPTS:
+                    if zm not in _pix_cache:
+                        _pix_cache[zm] = p.get_pixmap(
+                            matrix=fitz.Matrix(zm, zm), colorspace=fitz.csGRAY
+                        )
+                    si = _find_si(_ocr_text(p, psm=psm, zoom=zm, bin_threshold=thr,
+                                            _cached_pix=_pix_cache[zm]))
+                    if si:
+                        return i, (si, "ocr-full")
+
+            # Priority 2: crop region (ocr-crop / text-crop)
+            if crop:
+                if _TESS_OK:
                     clip_r = fitz.Rect(w * crop["x1"], h * crop["y1"], w * crop["x2"], h * crop["y2"])
-                    si = _find_si(_ocr_text(d[0], clip_r, psm=6))
-                finally:
-                    d.close()
+                    si = _find_si(_ocr_text(p, clip_r, psm=6))
+                    if si:
+                        return i, (si, "ocr-crop")
+                si = _find_si(page_crop_text[i])
                 if si:
-                    return i, (si, "ocr-crop")
-            si = _find_si(page_crop_text[i])
+                    return i, (si, "text-crop")
+
+            # Priorities 3–5: native text (pre-extracted, no PDF open needed)
+            si = _find_si(page_bot_text[i])
             if si:
-                return i, (si, "text-crop")
+                return i, (si, "text-bottom")
 
-        # Priorities 2–4a: native text (pre-extracted, no PDF open needed)
-        si = _find_si(page_bot_text[i])
-        if si:
-            return i, (si, "text-bottom")
+            si = _find_si(page_right_text[i])
+            if si:
+                return i, (si, "text-right")
 
-        si = _find_si(page_right_text[i])
-        if si:
-            return i, (si, "text-right")
-
-        si = _find_si(page_fast_text[i])
-        if si:
-            return i, (si, "text-full")
-
-        # Priority 4b: pymupdf4llm layout pass (single-page open)
-        if _ML4LLM_OK:
-            d = fitz.open(stream=page_bytes_list[i], filetype="pdf")
-            try:
-                md = _pymupdf4llm.to_markdown(d, pages=[0])
-                si = _find_si(_strip_markdown(md))
-            except Exception:
-                si = None
-            finally:
-                d.close()
+            si = _find_si(page_fast_text[i])
             if si:
                 return i, (si, "text-full")
 
-        # Priority 4c–6: OCR — open single-page PDF once for all OCR attempts
-        if _TESS_OK:
-            d = fitz.open(stream=page_bytes_list[i], filetype="pdf")
-            try:
-                p = d[0]
+            # Priority 6: pymupdf4llm layout pass (needs its own doc open — may mutate state)
+            if _ML4LLM_OK:
+                d = fitz.open(stream=page_bytes_list[i], filetype="pdf")
+                try:
+                    md = _pymupdf4llm.to_markdown(d, pages=[0])
+                    si = _find_si(_strip_markdown(md))
+                except Exception:
+                    si = None
+                finally:
+                    d.close()
+                if si:
+                    return i, (si, "text-full")
+
+            # Priorities 7–8: targeted OCR sub-regions (reuses ocr_doc)
+            if _TESS_OK:
                 si = _find_si(_ocr_text(p, fitz.Rect(0, h * 0.60, w, h)))
                 if si:
                     return i, (si, "ocr-bottom")
                 si = _find_si(_ocr_text(p, fitz.Rect(w * 0.50, 0, w, h)))
                 if si:
                     return i, (si, "ocr-right")
-                si = _find_si(_ocr_text(p))
-                if si:
-                    return i, (si, "ocr-full")
-            finally:
-                d.close()
 
-        return i, (f"page_{i + 1:04d}", "fallback")
+            return i, (f"page_{i + 1:04d}", "fallback")
+        finally:
+            if ocr_doc is not None:
+                ocr_doc.close()
 
     workers = min(_MAX_WORKERS, n)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
@@ -500,7 +533,7 @@ def process_pdf(pdf_bytes: bytes, customer_code: str) -> tuple[list[dict], bytes
     results: list[dict] = []
     used:    dict[str, int] = {}
     zip_buf = io.BytesIO()
-    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_STORED) as zf:
         for i, (si, method) in enumerate(raw):
             base = si
             if base in used:
@@ -716,9 +749,11 @@ def _rebuild_zip_renamed(zip_bytes: bytes, old_name: str, new_name: str) -> byte
     """Return a new ZIP identical to *zip_bytes* except one entry is renamed."""
     buf = io.BytesIO()
     with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as src:
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as dst:
-            for name in src.namelist():
-                dst.writestr(new_name if name == old_name else name, src.read(name))
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as dst:
+            for info in src.infolist():
+                data = src.read(info.filename)
+                dst.writestr(new_name if info.filename == old_name else info.filename, data,
+                             compress_type=zipfile.ZIP_STORED)
     return buf.getvalue()
 
 
@@ -949,12 +984,29 @@ def re_evaluate():
     new_si, new_method = None, None
 
     crop = _load_crop_region()
-    if crop and _TESS_OK:
+
+    # Priority 1: ocr-full with retries — consistent with main processor priority order.
+    if _TESS_OK:
+        _pix_cache: dict[int, object] = {}
+        for psm, zm, thr in _OCR_FULL_ATTEMPTS:
+            if zm not in _pix_cache:
+                _pix_cache[zm] = page.get_pixmap(
+                    matrix=fitz.Matrix(zm, zm), colorspace=fitz.csGRAY
+                )
+            new_si = _find_si(_ocr_text(page, psm=psm, zoom=zm, bin_threshold=thr,
+                                        _cached_pix=_pix_cache[zm]))
+            if new_si:
+                new_method = "ocr-full"
+                break
+
+    # Priority 2: crop region
+    if new_si is None and crop and _TESS_OK:
         clip_r = fitz.Rect(w * crop["x1"], h * crop["y1"], w * crop["x2"], h * crop["y2"])
         new_si = _find_si(_ocr_text(page, clip_r, psm=6))
         if new_si:
             new_method = "ocr-crop"
 
+    # Priorities 3–4: sub-region OCR
     if new_si is None and _TESS_OK:
         new_si = _find_si(_ocr_text(page, fitz.Rect(0, h * 0.60, w, h)))
         if new_si:
@@ -964,11 +1016,6 @@ def re_evaluate():
         new_si = _find_si(_ocr_text(page, fitz.Rect(w * 0.50, 0, w, h)))
         if new_si:
             new_method = "ocr-right"
-
-    if new_si is None and _TESS_OK:
-        new_si = _find_si(_ocr_text(page))
-        if new_si:
-            new_method = "ocr-full"
 
     doc.close()
 
