@@ -1042,6 +1042,113 @@ def re_evaluate():
                     "filename": new_filename, "method": new_method})
 
 
+@app.get("/render-result-page")
+def render_result_page():
+    """Render one page from a stored result ZIP as a base64 PNG for the region-select UI."""
+    token    = request.args.get("token", "").strip()
+    page_idx = request.args.get("page_index", "")
+
+    if not re.fullmatch(r'[A-Za-z0-9_\-]{24,40}', token):
+        return jsonify({"error": "Invalid token"}), 400
+
+    meta, page_idx = _validate_token_and_page(token, page_idx)
+    if meta is None:
+        return jsonify({"error": "Invalid token or page_index"}), 400
+
+    entry = meta["results"][page_idx]
+
+    try:
+        zip_bytes = _storage().bucket(UPLOAD_BUCKET).blob(
+            meta["zip_blob"]).download_as_bytes()
+    except Exception as exc:
+        return jsonify({"error": f"Failed to download result: {exc}"}), 500
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+            page_pdf_bytes = zf.read(entry["filename"])
+    except Exception as exc:
+        return jsonify({"error": f"Could not extract page: {exc}"}), 500
+
+    try:
+        doc  = fitz.open(stream=page_pdf_bytes, filetype="pdf")
+        page = doc[0]
+        pix  = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        img_b64 = base64.b64encode(pix.tobytes("png")).decode("ascii")
+        doc.close()
+        return jsonify({"image": f"data:image/png;base64,{img_b64}"})
+    except Exception as exc:
+        return jsonify({"error": f"Failed to render page: {exc}"}), 500
+
+
+@app.post("/re-evaluate-region")
+def re_evaluate_region():
+    """Run OCR on a user-drawn region of a page and update the result if an SI is found."""
+    data     = request.get_json(silent=True) or {}
+    token    = str(data.get("token", "")).strip()
+    page_idx = data.get("page_index")
+    region   = data.get("region") or {}
+
+    if not token or page_idx is None:
+        return jsonify({"error": "token and page_index are required"}), 400
+
+    meta, page_idx = _validate_token_and_page(token, page_idx)
+    if meta is None:
+        return jsonify({"error": "Invalid token or page_index"}), 400
+
+    try:
+        x1 = float(region["x1"])
+        y1 = float(region["y1"])
+        x2 = float(region["x2"])
+        y2 = float(region["y2"])
+    except (KeyError, ValueError, TypeError):
+        return jsonify({"error": "region must have x1, y1, x2, y2 as floats"}), 400
+
+    if x2 <= x1 or y2 <= y1:
+        return jsonify({"error": "Invalid region dimensions"}), 400
+
+    entry        = meta["results"][page_idx]
+    old_filename = entry["filename"]
+    cc           = entry.get("customer_code", "UNKNOWN")
+
+    try:
+        zip_bytes = _storage().bucket(UPLOAD_BUCKET).blob(
+            meta["zip_blob"]).download_as_bytes()
+    except Exception as exc:
+        return jsonify({"error": f"Failed to download result: {exc}"}), 500
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+            page_pdf_bytes = zf.read(old_filename)
+    except Exception as exc:
+        return jsonify({"error": f"Could not extract page: {exc}"}), 500
+
+    doc  = fitz.open(stream=page_pdf_bytes, filetype="pdf")
+    page = doc[0]
+    h, w = page.rect.height, page.rect.width
+    clip_r = fitz.Rect(w * x1, h * y1, w * x2, h * y2)
+    new_si = _find_si(_ocr_text(page, clip_r, psm=6))
+    doc.close()
+
+    if not new_si:
+        return jsonify({"ok": False, "message": "No SI number found in the selected region"})
+
+    new_si       = _sanitize(new_si)
+    new_method   = "ocr-region"
+    new_filename = f"SI_{cc}_{new_si}.pdf"
+
+    for i, r in enumerate(meta["results"]):
+        if i != page_idx and r["filename"] == new_filename:
+            return jsonify({"ok": False,
+                            "message": f"SI {new_si} already used by page {r['page']}"})
+
+    changed = new_filename != old_filename or new_method != entry["method"]
+    if changed:
+        _update_result_entry(token, page_idx, new_si, new_method, zip_bytes, meta)
+
+    return jsonify({"ok": True, "changed": changed, "si": new_si,
+                    "filename": new_filename, "method": new_method})
+
+
 @app.post("/rename-page")
 def rename_page():
     """Manually rename one page's SI number, rebuilding the ZIP entry."""

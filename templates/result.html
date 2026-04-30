@@ -30,7 +30,25 @@
     .pill-corr  {background:#fff3e0;color:#7c4a00}
     .pill-fall  {background:#fde8e8;color:#7c1e1e}
     .pill-manual{background:#f3e8ff;color:#5b21b6}
+    .pill-region{background:#dbeafe;color:#1e40af}
     .note{color:var(--muted);font-size:13px;margin-top:4px}
+
+    /* ── region OCR modal ── */
+    .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.58);z-index:1000;overflow-y:auto;padding:24px 16px}
+    .modal-box{background:#fff;border-radius:16px;max-width:860px;margin:0 auto;padding:24px;position:relative}
+    .modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+    .modal-close{background:none;border:1px solid var(--border);border-radius:6px;padding:3px 10px;cursor:pointer;font-size:16px;color:var(--muted);line-height:1.4}
+    .modal-close:hover{background:#f0f4f9;color:var(--ink)}
+    .modal-canvas-wrap{position:relative;border-radius:10px;overflow:hidden;border:1px solid var(--border);background:#1e293b;cursor:crosshair;user-select:none;-webkit-user-select:none}
+    #regionCanvas{display:block;width:100%;height:auto;touch-action:none}
+    .modal-hint{font-size:12px;color:var(--muted);margin-top:6px;text-align:center}
+    .modal-region-info{display:flex;align-items:center;gap:12px;margin-top:10px;padding:9px 12px;background:#f8fafc;border:1px solid var(--border);border-radius:8px;font-size:13px;flex-wrap:wrap}
+    .rval{font-weight:700;color:var(--navy);font-family:monospace}
+    .modal-actions{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap}
+    .modal-result{margin-top:10px;font-size:13px;display:none;padding:9px 12px;border-radius:8px}
+    .modal-result.ok{background:#f0fdf4;border:1px solid #86efac;color:#166534}
+    .modal-result.err{background:#fff0f0;border:1px solid #fca5a5;color:#b00020}
+    .modal-load{padding:32px;text-align:center;color:var(--muted);font-size:14px}
     .stat{display:flex;gap:24px;flex-wrap:wrap;margin-bottom:20px}
     .stat-item{text-align:center}
     .stat-num{font-size:28px;font-weight:700;color:var(--navy);line-height:1}
@@ -170,6 +188,7 @@
               {% if r.method != 'ocr-crop' %}
               <button class="icon-btn reval-btn" title="Re-evaluate using OCR">↺ OCR</button>
               {% endif %}
+              <button class="icon-btn region-btn" title="Re-evaluate with a custom drawn region">⊡ Region</button>
             </div>
           </td>
         </tr>
@@ -188,6 +207,7 @@ const TOKEN = {{ token | tojson }};
 const PILL_CLASS = {
   'text-crop':'pill-text','text-bottom':'pill-text','text-right':'pill-text','text-full':'pill-text',
   'ocr-crop':'pill-ocr','ocr-bottom':'pill-ocr','ocr-right':'pill-ocr','ocr-full':'pill-ocr',
+  'ocr-region':'pill-region',
   'sequence':'pill-seq','corrected':'pill-corr','fallback':'pill-fall','manual':'pill-manual',
 };
 function pillHtml(method) {
@@ -341,6 +361,293 @@ function wireReval(btn) {
 }
 
 document.querySelectorAll('.reval-btn').forEach(wireReval);
+
+/* ── Region OCR modal ──────────────────────────────────────── */
+(function () {
+  const modal    = document.getElementById('regionModal');
+  const canvas   = document.getElementById('regionCanvas');
+  const ctx      = canvas.getContext('2d');
+  const wrap     = document.getElementById('regionCanvasWrap');
+
+  const HH = 7, MINSZ = 12;
+  let img = null, cw = 0, ch = 0;
+  let sel = null, mode = 'idle', start = null, snap = null, hndl = null;
+  let activeRow = null, activePageIdx = null;
+
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  function norm(s) {
+    if (!s) return null;
+    return { x: Math.min(s.x, s.x+s.w), y: Math.min(s.y, s.y+s.h),
+             w: Math.abs(s.w), h: Math.abs(s.h) };
+  }
+
+  function getHandles(s) {
+    const { x, y, w, h } = s;
+    return [
+      { id:'nw', cx:x,     cy:y     }, { id:'n',  cx:x+w/2, cy:y     },
+      { id:'ne', cx:x+w,   cy:y     }, { id:'e',  cx:x+w,   cy:y+h/2 },
+      { id:'se', cx:x+w,   cy:y+h   }, { id:'s',  cx:x+w/2, cy:y+h   },
+      { id:'sw', cx:x,     cy:y+h   }, { id:'w',  cx:x,     cy:y+h/2 },
+    ];
+  }
+
+  function hitHandle(pos, s) {
+    for (const h of getHandles(s))
+      if (Math.abs(pos.x-h.cx) <= HH+3 && Math.abs(pos.y-h.cy) <= HH+3) return h;
+    return null;
+  }
+
+  function inside(pos, s) {
+    return pos.x >= s.x && pos.x <= s.x+s.w && pos.y >= s.y && pos.y <= s.y+s.h;
+  }
+
+  function applyResize(id, dx, dy, sn) {
+    let { x, y, w, h } = { ...sn };
+    if (id.includes('w')) { x = clamp(sn.x+dx, 0, sn.x+sn.w-1); w = sn.x+sn.w-x; }
+    if (id.includes('e')) { w = clamp(sn.w+dx, 1, cw-sn.x); }
+    if (id.includes('n')) { y = clamp(sn.y+dy, 0, sn.y+sn.h-1); h = sn.y+sn.h-y; }
+    if (id.includes('s')) { h = clamp(sn.h+dy, 1, ch-sn.y); }
+    return { x, y, w, h };
+  }
+
+  function epos(e) {
+    const r = canvas.getBoundingClientRect();
+    const src = e.touches ? e.touches[0] : e;
+    return {
+      x: clamp((src.clientX - r.left) * (cw / r.width),  0, cw),
+      y: clamp((src.clientY - r.top)  * (ch / r.height), 0, ch),
+    };
+  }
+
+  function draw() {
+    if (!img) return;
+    ctx.clearRect(0, 0, cw, ch);
+    ctx.drawImage(img, 0, 0, cw, ch);
+    const n = norm(sel);
+    if (!n || n.w < 2 || n.h < 2) {
+      ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(0, 0, cw, ch); return;
+    }
+    ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(0, 0, cw, ch);
+    ctx.save(); ctx.beginPath(); ctx.rect(n.x, n.y, n.w, n.h); ctx.clip();
+    ctx.drawImage(img, 0, 0, cw, ch); ctx.restore();
+    ctx.strokeStyle = '#0F4C81'; ctx.lineWidth = 2;
+    ctx.strokeRect(n.x+1, n.y+1, n.w-2, n.h-2);
+    for (const h of getHandles(n)) {
+      ctx.fillStyle = '#fff'; ctx.strokeStyle = '#0F4C81'; ctx.lineWidth = 2;
+      ctx.fillRect(h.cx-HH, h.cy-HH, HH*2, HH*2);
+      ctx.strokeRect(h.cx-HH, h.cy-HH, HH*2, HH*2);
+    }
+  }
+
+  function updateInfo() {
+    const n = norm(sel);
+    const ok = n && n.w >= MINSZ && n.h >= MINSZ;
+    document.getElementById('regionNoSel').style.display  = ok ? 'none' : '';
+    document.getElementById('regionStats').style.display  = ok ? '' : 'none';
+    document.getElementById('reprocessBtn').disabled = !ok;
+    if (!ok) return;
+    const pct = v => (v * 100).toFixed(1) + '%';
+    document.getElementById('rInfoX1').textContent = pct(n.x / cw);
+    document.getElementById('rInfoX2').textContent = pct((n.x+n.w) / cw);
+    document.getElementById('rInfoY1').textContent = pct(n.y / ch);
+    document.getElementById('rInfoY2').textContent = pct((n.y+n.h) / ch);
+    document.getElementById('rInfoW').textContent  = pct(n.w / cw);
+    document.getElementById('rInfoH').textContent  = pct(n.h / ch);
+  }
+
+  function resize() {
+    if (!img) return;
+    cw = wrap.clientWidth;
+    ch = Math.round(cw * img.naturalHeight / img.naturalWidth);
+    canvas.width = cw; canvas.height = ch; canvas.style.height = ch + 'px';
+  }
+
+  function onDown(e) {
+    e.preventDefault();
+    const pos = epos(e), n = norm(sel);
+    if (n && n.w > MINSZ && n.h > MINSZ) {
+      const h = hitHandle(pos, n);
+      if (h) { mode = 'resizing'; hndl = h.id; start = pos; snap = { ...n }; return; }
+      if (inside(pos, n)) { mode = 'moving'; start = pos; snap = { ...n }; return; }
+    }
+    mode = 'drawing'; start = pos; sel = { x: pos.x, y: pos.y, w: 0, h: 0 };
+    draw(); updateInfo();
+  }
+
+  function onMove(e) {
+    e.preventDefault();
+    const pos = epos(e);
+    if (mode === 'idle') {
+      const n = norm(sel);
+      if (n && n.w > MINSZ && n.h > MINSZ) {
+        const h = hitHandle(pos, n);
+        canvas.style.cursor = h ? h.id + '-resize' : inside(pos, n) ? 'move' : 'crosshair';
+      } else canvas.style.cursor = 'crosshair';
+      return;
+    }
+    const dx = pos.x - start.x, dy = pos.y - start.y;
+    if (mode === 'drawing') {
+      sel = { x: Math.min(start.x, pos.x), y: Math.min(start.y, pos.y),
+              w: Math.abs(dx), h: Math.abs(dy) };
+    } else if (mode === 'moving') {
+      sel = { x: clamp(snap.x+dx, 0, cw-snap.w), y: clamp(snap.y+dy, 0, ch-snap.h),
+              w: snap.w, h: snap.h };
+    } else if (mode === 'resizing') {
+      sel = applyResize(hndl, dx, dy, snap);
+    }
+    draw(); updateInfo();
+  }
+
+  function onUp() {
+    if (mode !== 'idle') { if (sel) sel = norm(sel); mode = 'idle'; hndl = null; draw(); updateInfo(); }
+  }
+
+  canvas.addEventListener('mousedown',  onDown);
+  canvas.addEventListener('mousemove',  onMove);
+  canvas.addEventListener('mouseup',    onUp);
+  canvas.addEventListener('mouseleave', onUp);
+  canvas.addEventListener('touchstart', onDown, { passive: false });
+  canvas.addEventListener('touchmove',  onMove, { passive: false });
+  canvas.addEventListener('touchend',   onUp);
+  window.addEventListener('resize', () => { if (img) { resize(); draw(); } });
+  window.addEventListener('keydown', e => {
+    if (modal.style.display !== 'none') {
+      if (e.key === 'Escape') closeModal();
+      if ((e.key === 'Enter') && !document.getElementById('reprocessBtn').disabled)
+        document.getElementById('reprocessBtn').click();
+    }
+  });
+
+  /* ── open / close ── */
+  function openModal(row, pageIdx) {
+    activeRow = row; activePageIdx = pageIdx;
+    document.getElementById('regionModalTitle').textContent = `Draw SI Region — Page ${pageIdx + 1}`;
+    sel = null; img = null; mode = 'idle';
+    wrap.style.display = 'none';
+    document.getElementById('regionInfoBar').style.display = 'none';
+    document.getElementById('regionResultMsg').className = 'modal-result';
+    document.getElementById('regionResultMsg').style.display = 'none';
+    document.getElementById('reprocessBtn').disabled = true;
+    document.getElementById('reprocessBtn').textContent = '↺ Reprocess';
+    const loadEl = document.getElementById('regionLoadMsg');
+    loadEl.textContent = 'Loading page…';
+    loadEl.style.display = 'block';
+    modal.style.display = 'block';
+    document.body.style.overflow = 'hidden';
+
+    fetch(`/render-result-page?token=${encodeURIComponent(TOKEN)}&page_index=${pageIdx}`)
+      .then(r => r.json())
+      .then(data => {
+        if (data.error) { loadEl.textContent = '✗ ' + data.error; return; }
+        const i = new Image();
+        i.onload = () => {
+          img = i;
+          loadEl.style.display = 'none';
+          wrap.style.display = '';
+          document.getElementById('regionInfoBar').style.display = '';
+          resize(); draw(); updateInfo();
+        };
+        i.src = data.image;
+      })
+      .catch(err => { loadEl.textContent = '✗ ' + err.message; });
+  }
+
+  function closeModal() {
+    modal.style.display = 'none';
+    document.body.style.overflow = '';
+    activeRow = null; activePageIdx = null;
+  }
+
+  document.getElementById('regionModalClose').addEventListener('click', closeModal);
+  document.getElementById('regionCancelBtn').addEventListener('click', closeModal);
+  document.getElementById('regionClearBtn').addEventListener('click', () => { sel = null; draw(); updateInfo(); });
+  modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
+
+  /* ── reprocess ── */
+  document.getElementById('reprocessBtn').addEventListener('click', async () => {
+    const n = norm(sel);
+    if (!n || n.w < MINSZ || n.h < MINSZ) return;
+    const region = { x1: n.x/cw, y1: n.y/ch, x2: (n.x+n.w)/cw, y2: (n.y+n.h)/ch };
+
+    const btn = document.getElementById('reprocessBtn');
+    const msgEl = document.getElementById('regionResultMsg');
+    btn.disabled = true; btn.textContent = '…';
+    msgEl.style.display = 'none';
+
+    try {
+      const resp = await fetch('/re-evaluate-region', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: TOKEN, page_index: activePageIdx, region }),
+      });
+      const data = await resp.json();
+
+      if (!data.ok) {
+        msgEl.textContent = data.message || data.error || 'Reprocess failed';
+        msgEl.className = 'modal-result err'; msgEl.style.display = 'block';
+        btn.disabled = false; btn.textContent = '↺ Reprocess';
+        return;
+      }
+
+      if (data.changed && activeRow) {
+        activeRow.querySelector('.fn-display code').textContent = data.filename;
+        activeRow.querySelector('.si-input').value = data.si;
+        activeRow.querySelector('.method-cell').innerHTML = pillHtml(data.method);
+      }
+      msgEl.textContent = data.changed ? `✓ Updated → ${data.filename}` : '✓ No change — OCR agrees with current value';
+      msgEl.className = 'modal-result ok'; msgEl.style.display = 'block';
+      setTimeout(closeModal, 1400);
+    } catch (e) {
+      msgEl.textContent = 'Network error';
+      msgEl.className = 'modal-result err'; msgEl.style.display = 'block';
+      btn.disabled = false; btn.textContent = '↺ Reprocess';
+    }
+  });
+
+  /* ── wire buttons ── */
+  function wireRegionBtn(btn) {
+    btn.addEventListener('click', () => {
+      const row = btn.closest('tr');
+      openModal(row, parseInt(row.dataset.idx));
+    });
+  }
+  document.querySelectorAll('.region-btn').forEach(wireRegionBtn);
+  window._wireRegionBtn = wireRegionBtn;
+})();
 </script>
+
+<!-- Region OCR modal -->
+<div id="regionModal" class="modal-overlay" style="display:none">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2 id="regionModalTitle" style="font-size:18px;margin:0">Draw SI Region</h2>
+      <button class="modal-close" id="regionModalClose">✕</button>
+    </div>
+    <p style="color:var(--muted);font-size:14px;margin-bottom:12px">
+      Draw a box around the SI number on this page, then click <b>Reprocess</b>.
+    </p>
+    <div id="regionLoadMsg" class="modal-load">Loading page…</div>
+    <div class="modal-canvas-wrap" id="regionCanvasWrap" style="display:none">
+      <canvas id="regionCanvas"></canvas>
+    </div>
+    <div class="modal-hint">Drag to draw · drag inside to move · drag corners/edges to resize · Esc to clear</div>
+    <div class="modal-region-info" id="regionInfoBar" style="display:none">
+      <span id="regionNoSel" style="color:var(--muted);font-style:italic">Draw a selection to begin.</span>
+      <span id="regionStats" style="display:none">
+        x: <span class="rval" id="rInfoX1"></span>–<span class="rval" id="rInfoX2"></span>
+        &ensp;y: <span class="rval" id="rInfoY1"></span>–<span class="rval" id="rInfoY2"></span>
+        &ensp;w: <span class="rval" id="rInfoW"></span>
+        &ensp;h: <span class="rval" id="rInfoH"></span>
+      </span>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" id="reprocessBtn" disabled style="background:var(--navy);color:#fff">↺ Reprocess</button>
+      <button class="btn btn-outline" id="regionClearBtn">Clear</button>
+      <button class="btn btn-outline" id="regionCancelBtn">Cancel</button>
+    </div>
+    <div id="regionResultMsg" class="modal-result"></div>
+  </div>
+</div>
 </body>
 </html>
