@@ -42,9 +42,12 @@ except Exception:
     _pytesseract = None  # type: ignore[assignment]
     _TESS_OK = False
 
-UPLOAD_BUCKET     = os.environ.get("UPLOAD_BUCKET", "sbic-splitter-uploads")
-OPTIMIZE_LIMIT_MB = int(os.environ.get("OPTIMIZE_LIMIT_MB", 2048))  # Flask hard cap for /optimize-only
-TMP_DIR           = Path(tempfile.gettempdir()) / "inv_sep"
+UPLOAD_BUCKET       = os.environ.get("UPLOAD_BUCKET", "sbic-splitter-uploads")
+OPTIMIZE_LIMIT_MB   = int(os.environ.get("OPTIMIZE_LIMIT_MB", 2048))  # Flask hard cap for /optimize-only
+# Skip lossless rewrite for files already under this threshold — the rewrite cost
+# outweighs any benefit for small, well-compressed PDFs.
+OPTIMIZE_MIN_MB     = float(os.environ.get("OPTIMIZE_MIN_MB", 5))
+TMP_DIR             = Path(tempfile.gettempdir()) / "inv_sep"
 TMP_DIR.mkdir(exist_ok=True)
 RESULT_TTL = 3600  # seconds — local temp files expire after 1 hour
 JOB_TTL    = 3600  # seconds — in-memory job entries expire after 1 hour
@@ -436,14 +439,32 @@ def process_pdf(pdf_bytes: bytes, customer_code: str,
         pg = doc[i]
         h, w = pg.rect.height, pg.rect.width
         page_dims.append((h, w))
-        page_fast_text.append(pg.get_text("text"))
-        page_bot_text.append(pg.get_text("text", clip=fitz.Rect(0, h * 0.60, w, h)))
-        page_right_text.append(pg.get_text("text", clip=fitz.Rect(w * 0.50, 0, w, h)))
-        page_crop_text.append(
-            pg.get_text("text", clip=fitz.Rect(
-                w * crop["x1"], h * crop["y1"], w * crop["x2"], h * crop["y2"]
-            )) if crop else ""
+
+        # One get_text("blocks") call replaces 3-4 separate clip-filtered get_text("text")
+        # calls. Each call iterated the full page object graph; now we do it once and
+        # derive all region strings from the block bounding boxes in Python.
+        # block format: (x0, y0, x1, y1, text, block_no, block_type)  — type 0 = text
+        raw_blocks = pg.get_text("blocks")
+        txt_blocks = [(b[0], b[1], b[2], b[3], b[4]) for b in raw_blocks if b[6] == 0]
+
+        all_text   = "\n".join(b[4] for b in txt_blocks)
+        # Use block-overlap thresholds (more inclusive than block-start thresholds):
+        # any block whose bottom edge is in the lower 40% overlaps the bottom region.
+        bot_text   = "\n".join(b[4] for b in txt_blocks if b[3] > h * 0.60)
+        right_text = "\n".join(b[4] for b in txt_blocks if b[2] > w * 0.50)
+        crop_text  = (
+            "\n".join(
+                b[4] for b in txt_blocks
+                if b[2] > w * crop["x1"] and b[0] < w * crop["x2"]
+                and b[3] > h * crop["y1"] and b[1] < h * crop["y2"]
+            ) if crop else ""
         )
+
+        page_fast_text.append(all_text)
+        page_bot_text.append(bot_text)
+        page_right_text.append(right_text)
+        page_crop_text.append(crop_text)
+
         single = fitz.open()
         single.insert_pdf(doc, from_page=i, to_page=i)
         # deflate=False: page bytes are uncompressed so workers parse them faster.
@@ -455,11 +476,11 @@ def process_pdf(pdf_bytes: bytes, customer_code: str,
         doc.close()
 
     # ── Phase 2: parallel SI extraction using pre-extracted data ──────────────
-    # Each worker tries methods in cost order:
-    #   1. Pre-extracted native text (free — already in memory)
-    #   2. pymupdf4llm layout pass (1 single-page PDF open — no Tesseract)
-    #   3. OCR fallback (1 single-page PDF open, shared by all OCR attempts)
-    # Workers only pay for OCR when all text methods fail.
+    # Cost order per worker:
+    #   1. Pre-extracted native text (free — already in memory, no PDF open)
+    #   2. OCR — opens single-page PDF once, shared by all OCR attempts
+    #   3. pymupdf4llm — last resort; slower than OCR retries
+    # Workers only open a PDF when all native text methods fail.
     raw: list[tuple[str, str]] = [("", "")] * n
 
     def _worker(i: int) -> tuple[int, tuple[str, str]]:
@@ -486,65 +507,61 @@ def process_pdf(pdf_bytes: bytes, customer_code: str,
             if si:
                 return i, (si, "text-crop")
 
-        # Priority 3: pymupdf4llm layout pass — better table/column extraction than
-        # raw get_text; still no Tesseract needed.
-        if _ML4LLM_OK:
-            d = fitz.open(stream=page_bytes_list[i], filetype="pdf")
-            try:
-                md = _pymupdf4llm.to_markdown(d, pages=[0])
-                si = _find_si(_strip_markdown(md))
-            except Exception:
-                si = None
-            finally:
-                d.close()
-            if si:
-                return i, (si, "text-llm")
-
-        # All text methods failed — fall back to OCR.
-        # Open the single-page PDF once; shared by all OCR calls in this worker.
-        if not _TESS_OK:
+        # All native text methods failed — open single-page PDF once for OCR + llm.
+        if not _TESS_OK and not _ML4LLM_OK:
             return i, (f"page_{i + 1:04d}", "fallback")
 
         ocr_doc = fitz.open(stream=page_bytes_list[i], filetype="pdf")
         try:
             p = ocr_doc[0]
 
-            # Priority 4: ocr-full — 3 attempts with different PSM/zoom combos.
-            # _OCR_FULL_ATTEMPTS is ordered so same-zoom passes share the pixmap/PIL
-            # cache and the expensive 4× render is deferred to the last attempt.
-            _pix_cache: dict[int, object] = {}
-            _pil_cache: dict[int, object] = {}
-            for psm, zm, thr in _OCR_FULL_ATTEMPTS:
-                if zm not in _pix_cache:
-                    _pix_cache[zm] = p.get_pixmap(
-                        matrix=fitz.Matrix(zm, zm), colorspace=fitz.csGRAY
-                    )
-                if zm not in _pil_cache:
-                    _px = _pix_cache[zm]
-                    _base = Image.frombytes("L", (_px.width, _px.height), _px.samples)
-                    _base = _base.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
-                    _base = ImageEnhance.Contrast(_base).enhance(2.0)
-                    _pil_cache[zm] = _base
-                si = _find_si(_ocr_text(p, psm=psm, zoom=zm, bin_threshold=thr,
-                                        _cached_pix=_pix_cache[zm],
-                                        _cached_img=_pil_cache[zm]))
-                if si:
-                    return i, (si, "ocr-full")
+            # Priority 3: ocr-full — 3 attempts ordered to share the 3× pixmap before
+            # rendering the expensive 4× pixmap (deferred to the last attempt).
+            if _TESS_OK:
+                _pix_cache: dict[int, object] = {}
+                _pil_cache: dict[int, object] = {}
+                for psm, zm, thr in _OCR_FULL_ATTEMPTS:
+                    if zm not in _pix_cache:
+                        _pix_cache[zm] = p.get_pixmap(
+                            matrix=fitz.Matrix(zm, zm), colorspace=fitz.csGRAY
+                        )
+                    if zm not in _pil_cache:
+                        _px = _pix_cache[zm]
+                        _base = Image.frombytes("L", (_px.width, _px.height), _px.samples)
+                        _base = _base.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+                        _base = ImageEnhance.Contrast(_base).enhance(2.0)
+                        _pil_cache[zm] = _base
+                    si = _find_si(_ocr_text(p, psm=psm, zoom=zm, bin_threshold=thr,
+                                            _cached_pix=_pix_cache[zm],
+                                            _cached_img=_pil_cache[zm]))
+                    if si:
+                        return i, (si, "ocr-full")
 
-            # Priority 5: crop region OCR
-            if crop:
-                clip_r = fitz.Rect(w * crop["x1"], h * crop["y1"], w * crop["x2"], h * crop["y2"])
-                si = _find_si(_ocr_text(p, clip_r, psm=6))
-                if si:
-                    return i, (si, "ocr-crop")
+                # Priority 4: crop region OCR
+                if crop:
+                    clip_r = fitz.Rect(w * crop["x1"], h * crop["y1"], w * crop["x2"], h * crop["y2"])
+                    si = _find_si(_ocr_text(p, clip_r, psm=6))
+                    if si:
+                        return i, (si, "ocr-crop")
 
-            # Priority 6: targeted OCR sub-regions
-            si = _find_si(_ocr_text(p, fitz.Rect(0, h * 0.60, w, h)))
-            if si:
-                return i, (si, "ocr-bottom")
-            si = _find_si(_ocr_text(p, fitz.Rect(w * 0.50, 0, w, h)))
-            if si:
-                return i, (si, "ocr-right")
+                # Priority 5: targeted OCR sub-regions
+                si = _find_si(_ocr_text(p, fitz.Rect(0, h * 0.60, w, h)))
+                if si:
+                    return i, (si, "ocr-bottom")
+                si = _find_si(_ocr_text(p, fitz.Rect(w * 0.50, 0, w, h)))
+                if si:
+                    return i, (si, "ocr-right")
+
+            # Priority 6: pymupdf4llm — layout-aware markdown extraction; last resort
+            # because it re-opens its own doc internally and is slower than OCR retries.
+            if _ML4LLM_OK:
+                try:
+                    md = _pymupdf4llm.to_markdown(ocr_doc, pages=[0])
+                    si = _find_si(_strip_markdown(md))
+                except Exception:
+                    si = None
+                if si:
+                    return i, (si, "text-llm")
 
             return i, (f"page_{i + 1:04d}", "fallback")
         finally:
@@ -617,7 +634,10 @@ def _process_job(job_id: str, blob_name: str, filename: str) -> None:
 
         try:
             customer_code  = _resolve_customer_code(filename)
-            pdf_bytes      = _optimize_pdf(pdf_bytes)
+            # Skip lossless rewrite for already-small files — the rewrite overhead
+            # (full doc parse + save) costs more time than the size reduction saves.
+            if len(pdf_bytes) > OPTIMIZE_MIN_MB * 1024 * 1024:
+                pdf_bytes = _optimize_pdf(pdf_bytes)
             optimized_size = len(pdf_bytes)
         except MemoryError:
             _fail(
